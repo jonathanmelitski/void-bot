@@ -100,7 +100,7 @@ Set `THROWING_CHANNEL_ID` and `ANTHROPIC_API_KEY` in `.env`. The bot does nothin
 When it's tagged:
 
 1. It fetches the last hour of the channel (up to 200 messages) and Claude Haiku 4.5 picks out the throwing reports that aren't logged yet. Examples: "threw 45 min with" followed by an @mention or a name, or "hour and a half of hucks yesterday". The tag can be the report itself, or just a nudge to pick up earlier ones.
-2. **Complete reports** are saved and the bot reacts on the report: with the server's `:void_throw_<minutes>:` emoji if there is one for exactly that many minutes (`:void_throw_45:` for 45), otherwise ✅. It posts nothing in the channel.
+2. **Complete reports** are saved and the bot reacts on the report with the `:void_throw_<minutes>:` emoji, or ✅ if that emoji hasn't been uploaded. It posts nothing in the channel. Minutes are rounded to the nearest unit there's an emoji for, and the rounded number is what's saved: every 5 minutes up to 60, every 10 up to 120, every 15 up to 180. So 42 is logged as 40, 65 as 70, and anything over 180 as 180.
 3. **Incomplete reports:** if the minutes are missing, or a name is ambiguous (it matches two people) or unknown, the bot starts a thread on the report and asks there, mentioning the reporter silently. A report that already has a thread doesn't get a second one.
 4. **Answers:** the bot reads messages posted in those threads, without needing a tag. Once the report is complete it's logged and the thread is deleted. It asks at most 3 questions per report. Saying "cancel" drops it; that thread archives itself after an hour.
 
@@ -110,7 +110,7 @@ The reporter is counted as a participant unless they say otherwise. Claude looks
 
 The bot's role needs these permissions in the channel: **View Channel**, **Read Message History**, **Add Reactions**, **Create Public Threads**, **Send Messages in Threads** and **Manage Threads** (to delete a thread once its report is logged; without it the thread is left to archive).
 
-The emoji come from `scripts/make_emotes.py`, which draws a flying disc with the minutes next to it for 5 to 180 minutes: `pipenv run pip install pillow`, `pipenv run python scripts/make_emotes.py`, then upload the PNGs in `emotes/` under **Server Settings → Emoji**. Discord names each emoji after its file. The bot works without them.
+The emoji come from `scripts/make_emotes.py`, which draws a flying disc with the minutes next to it for 5 to 180 minutes: `pipenv run pip install pillow`, `pipenv run python scripts/make_emotes.py`, then upload the PNGs in `emotes/` either to the bot's application (Developer Portal → your app → **Emojis**) or to the server (**Server Settings → Emoji**). Discord names each emoji after its file. The bot looks in the server first, then the application, and reads the application's list once at first use, so restart it after uploading more. It works without them.
 
 Tables: `throwing_sessions` (UUID `id`, `occurred_at`, `minutes`, `description`, `reported_by`, `source_message_id`) and `session_participants` (`session_id`, `discord_id`). `report_threads` maps a report's message ID to the open question thread about it, and holds IDs only. There's no command for viewing totals yet.
 

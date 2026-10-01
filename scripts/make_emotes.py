@@ -11,7 +11,8 @@ from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFont
 
-# Every 5 minutes up to an hour, every 10 up to two hours, every 15 up to three.
+# Every 5 minutes up to an hour, every 10 up to two hours, every 15 up to three. The bot rounds every
+# session to one of these; keep in step with LOGGED_MINUTES in bot/cogs/throwing.py.
 MINUTES = [*range(5, 61, 5), *range(70, 121, 10), *range(135, 181, 15)]
 
 SIZE = 128  # Discord's recommended emoji size

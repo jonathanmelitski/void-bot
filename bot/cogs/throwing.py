@@ -29,6 +29,9 @@ MAX_MESSAGES = 200
 MAX_THREAD_MESSAGES = 50
 MAX_QUESTIONS = 3
 MAX_MINUTES = 24 * 60
+# Sessions are logged as the nearest of these, one per void_throw_<minutes> emote. Keep in step with
+# MINUTES in scripts/make_emotes.py.
+LOGGED_MINUTES = [*range(5, 61, 5), *range(70, 121, 10), *range(135, 181, 15)]
 TEXT_TYPES = (discord.MessageType.default, discord.MessageType.reply)
 NEEDED_PERMISSIONS = [
     "view_channel", "read_message_history", "add_reactions", "create_public_threads", "send_messages_in_threads",
@@ -52,6 +55,7 @@ class Throwing(commands.Cog):
         self.parser = SessionParser(config.CLAUDE_MODEL)
         self.tz = ZoneInfo(config.TIMEZONE)
         self.lock = asyncio.Lock()
+        self.app_emotes: dict[str, discord.Emoji] | None = None  # by name; loaded on first use
 
     @property
     def db(self):
@@ -188,17 +192,22 @@ class Throwing(commands.Cog):
 
     async def _log(self, item: Item, report: FoundReport, participants: list[int]):
         message = item.message
+        # Round to the nearest unit (halfway goes up): 42 is logged as 40, and anything past 180 as 180.
+        minutes = min(LOGGED_MINUTES, key=lambda unit: (abs(unit - report.minutes), -unit))
         session_id = await self.db.log_session(
             occurred_at=self._occurred_at(report.occurred_at, message.created_at),
-            minutes=report.minutes,
+            minutes=minutes,
             description=report.description,
             participant_ids=participants,
             reported_by=message.author.id,
             source_message_id=message.id,
         )
         item.logged = True
-        log.info("Logged session %s: %d min, %d people, from %s", session_id, report.minutes, len(participants), message.jump_url)
-        await self._confirm(message, report.minutes)
+        log.info(
+            "Logged session %s: %d min (reported %d), %d people, from %s",
+            session_id, minutes, report.minutes, len(participants), message.jump_url,
+        )
+        await self._confirm(message, minutes)
         if item.thread:
             try:
                 await item.thread.delete()
@@ -240,16 +249,30 @@ class Throwing(commands.Cog):
     # ---- helpers ----
 
     async def _confirm(self, message: discord.Message, minutes: int):
-        """The only confirmation: the server's void_throw_<minutes> emote (scripts/make_emotes.py) if it
-        has one for exactly that many minutes, otherwise a ✅."""
-        emote = discord.utils.get(message.guild.emojis, name=f"void_throw_{minutes}")
-        if emote and emote.is_usable():
+        """The only confirmation: the void_throw_<minutes> emote (scripts/make_emotes.py), or a ✅ if
+        it hasn't been uploaded."""
+        emote = await self._emote(message.guild, f"void_throw_{minutes}")
+        if emote:
             try:
                 await message.add_reaction(emote)
                 return
             except discord.HTTPException as e:
                 log.warning("Couldn't react with :%s: on %s: %s", emote.name, message.jump_url, e)
         await self._react(message, "✅")
+
+    async def _emote(self, guild: discord.Guild, name: str) -> discord.Emoji | None:
+        """An emoji by name: one uploaded to the server, or one uploaded to the bot's application
+        (Developer Portal -> Emojis). Application emoji are fetched once and kept until restart."""
+        emote = discord.utils.get(guild.emojis, name=name)
+        if emote and emote.is_usable():
+            return emote
+        if self.app_emotes is None:
+            try:
+                self.app_emotes = {e.name: e for e in await self.bot.fetch_application_emojis()}
+            except discord.HTTPException as e:
+                log.warning("Couldn't fetch the application's emoji: %s", e)
+                return None
+        return self.app_emotes.get(name)
 
     @staticmethod
     async def _react(message: discord.Message, emoji: str):
