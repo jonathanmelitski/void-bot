@@ -118,10 +118,46 @@ Tables: `throwing_sessions` (UUID `id`, `occurred_at`, `minutes`, `description`,
 
 `/throwing query question` answers a plain-English question about the logged sessions, for example "who has under 100 minutes this week?" or "how many sessions do" two named people "have this week compared to each other?". Like `/player`, only server admins and `ADMIN_ROLE_IDS` roles can use it, and the answer is only visible to the person who asked. It needs `ANTHROPIC_API_KEY`, but not `THROWING_CHANNEL_ID`.
 
-- Claude (`CLAUDE_MODEL`) answers using three read-only tools: find members by name, total minutes and sessions per person over a date range, and list sessions. It never writes SQL, each tool runs one fixed query, and nothing can add, change or delete a session.
+- Claude (`CLAUDE_MODEL`) answers using four read-only tools: find members by name, total minutes and sessions per person over a date range, list sessions, and list throwing groups with their minutes. It never writes SQL, each tool runs one fixed query, and nothing can add, change or delete a session.
 - "Everyone" means the roster: people in the player database who are still in the server, including those with nothing logged, plus anyone else with logged minutes. Run `/player import-role` first, or people with zero minutes can't show up.
 - Weeks start on Monday. A question with no time range is answered for all time.
 - The tools can't see emails, phone numbers or Penn IDs.
+
+### Throwing groups
+
+A throwing group is a set of members with a life: a start date and an end date. `/throwing-mgr` manages them. Like `/player`, only server admins and `ADMIN_ROLE_IDS` roles can use it, and it doesn't need `ANTHROPIC_API_KEY`.
+
+`/throwing-mgr creategroups` opens a form:
+
+- **Pool:** roles and/or individual people. Everyone with a picked role is included; bots are left out.
+- **Exclude:** roles and/or individual people to leave out, even if they're in the pool. Optional.
+- **Group size**.
+- **Dates:** the first and last day, both included, as `YYYY-MM-DD to YYYY-MM-DD`. They share one box because a Discord form holds five fields at most.
+- **Allow solo groups:** if one person is left over, they get a group of their own. Otherwise they join another group, making it one bigger. Two or more left over always form a smaller group.
+- **Group minutes count solo throwing** and **Group minutes require all members:** see the rules below.
+- **End all other groups:** every group that's running or yet to start ends when you confirm.
+
+You then get a preview only you can see, with **Confirm**, **Reshuffle** and **Cancel**. Confirm saves the groups and posts them in the channel you ran the command in, mentioning everyone silently.
+
+| Command | What it does |
+| --- | --- |
+| `/throwing-mgr list [include_ended]` | Groups with their dates, members and minutes |
+| `/throwing-mgr show group` | One group, with its rules |
+| `/throwing-mgr edit group` | Change the name, dates or the two minutes settings in a form |
+| `/throwing-mgr add-member group member` | Add someone |
+| `/throwing-mgr remove-member group member` | Remove someone |
+| `/throwing-mgr end group` | End it now; it keeps its minutes |
+| `/throwing-mgr delete group` | Delete it. Logged sessions aren't touched |
+
+The `group` option autocompletes as you type an ID, a group name or a member's name.
+
+**What counts towards a group's minutes.** A session is looked at for a group if it happened during the group's life and at least one member took part. Its minutes count once for the group, however many members were there:
+
+- every member took part: always counts;
+- two or more members, but not all: counts unless **require all members** is on;
+- exactly one member, alone or with people outside the group: counts only if **count solo throwing** is on.
+
+Nothing is stored when a session is logged. The `session_groups` view works this out from the sessions, the groups and their settings each time it's read (`session_id`, `group_id`, `members_present`, `group_size`, and `counts`), so editing a group, its members or a session can never leave it out of date. `/throwing query` and superadmin requests can both see groups. Tables: `throwing_groups` and `throwing_group_members`.
 
 ## Superadmin requests
 

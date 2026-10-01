@@ -59,6 +59,16 @@ def parse_life(start_text: str, end_text: str) -> tuple[datetime, datetime]:
     return datetime.combine(first, time(), TZ), datetime.combine(last + timedelta(days=1), time(), TZ)
 
 
+def split_dates(text: str) -> tuple[str, str]:
+    """ "2026-10-02 to 2026-10-08" -> its two dates. A single date means a one-day life."""
+    found = re.findall(r"\d[\d/-]*\d|\d", text)
+    if len(found) == 1:
+        return found[0], found[0]
+    if len(found) != 2:
+        raise InputError(f"Dates `{text}` should be a first and last day, like `2026-10-02 to 2026-10-08`.")
+    return found[0], found[1]
+
+
 def first_day(group: dict) -> date:
     return datetime.fromisoformat(group["starts_at"]).astimezone(TZ).date()
 
@@ -95,11 +105,11 @@ def rules_text(count_solo: bool, require_all: bool) -> str:
 
 def make_groups(member_ids: list[int], size: int, allow_solo: bool) -> list[list[int]]:
     """Shuffle the pool into groups of `size`. A smaller group takes the leftovers; a single
-    leftover person joins the last full group unless solo groups are allowed."""
+    leftover person joins the last full group unless solo groups are allowed (or the size is 1)."""
     pool = list(member_ids)
     random.shuffle(pool)
     groups = [pool[i:i + size] for i in range(0, len(pool), size)]
-    if len(groups) > 1 and len(groups[-1]) == 1 and not allow_solo:
+    if size > 1 and len(groups) > 1 and len(groups[-1]) == 1 and not allow_solo:
         groups[-2].extend(groups.pop())
     return groups
 
@@ -116,24 +126,25 @@ def chunks(lines: list[str], limit: int = 2000) -> list[str]:
 
 
 class CreateGroupsModal(discord.ui.Modal, title="Create throwing groups"):
+    # A form holds five fields at most, which is why the two dates share one.
     pool = discord.ui.Label(
         text="Pool",
         description="Roles and/or people to split into groups. Bots are left out.",
         component=discord.ui.MentionableSelect(min_values=1, max_values=25),
     )
+    exclude = discord.ui.Label(
+        text="Exclude",
+        description="Roles and/or people to leave out, even if they're in the pool.",
+        component=discord.ui.MentionableSelect(min_values=0, max_values=25, required=False),
+    )
     size = discord.ui.Label(
         text="Group size",
         component=discord.ui.TextInput(default="2", max_length=2),
     )
-    start = discord.ui.Label(
-        text="Start date",
-        description="First day the groups count for. YYYY-MM-DD.",
-        component=discord.ui.TextInput(max_length=10),
-    )
-    end = discord.ui.Label(
-        text="End date",
-        description="Last day the groups count for. YYYY-MM-DD.",
-        component=discord.ui.TextInput(max_length=10),
+    dates = discord.ui.Label(
+        text="Dates",
+        description="First and last day the groups count for: YYYY-MM-DD to YYYY-MM-DD.",
+        component=discord.ui.TextInput(max_length=30),
     )
     settings = discord.ui.Label(
         text="Settings",
@@ -150,31 +161,37 @@ class CreateGroupsModal(discord.ui.Modal, title="Create throwing groups"):
         super().__init__()
         self.db = db
         today = datetime.now(TZ).date()
-        typed = typed or {"size": "2", "start": str(today), "end": str(today + timedelta(days=6))}
+        typed = typed or {"size": "2", "dates": f"{today} to {today + timedelta(days=6)}"}
         self.size.component.default = typed["size"]
-        self.start.component.default = typed["start"]
-        self.end.component.default = typed["end"]
+        self.dates.component.default = typed["dates"]
+
+    @staticmethod
+    def _people(picked: list) -> dict[int, discord.Member]:
+        """The human members behind a mix of picked roles and people."""
+        people = {}
+        for item in picked:
+            for m in item.members if isinstance(item, discord.Role) else [item]:
+                if isinstance(m, discord.Member) and not m.bot:
+                    people[m.id] = m
+        return people
 
     async def on_submit(self, interaction: discord.Interaction):
-        typed = {name: getattr(self, name).component.value.strip() for name in ("size", "start", "end")}
+        typed = {name: getattr(self, name).component.value.strip() for name in ("size", "dates")}
         chosen = set(self.settings.component.values)
         if not interaction.guild.chunked:
             await interaction.guild.chunk()  # role.members is only complete once the member list is loaded
-        members: dict[int, discord.Member] = {}
-        for picked in self.pool.component.values:
-            for m in picked.members if isinstance(picked, discord.Role) else [picked]:
-                if isinstance(m, discord.Member) and not m.bot:
-                    members[m.id] = m
+        excluded = self._people(self.exclude.component.values)
+        members = {i: m for i, m in self._people(self.pool.component.values).items() if i not in excluded}
         try:
             if not typed["size"].isdigit() or not 1 <= int(typed["size"]) <= MAX_GROUP_SIZE:
                 raise InputError(f"Group size has to be a number from 1 to {MAX_GROUP_SIZE}.")
-            starts_at, ends_at = parse_life(typed["start"], typed["end"])
+            starts_at, ends_at = parse_life(*split_dates(typed["dates"]))
             if not members:
-                raise InputError("Nobody is in that pool.")
+                raise InputError("Nobody is left in that pool." if excluded else "Nobody is in that pool.")
             if len(members) == 1 and "allow_solo" not in chosen and int(typed["size"]) > 1:
                 raise InputError("There's only one person in that pool, and solo groups aren't allowed.")
         except InputError as e:
-            # The pool and checkboxes have to be picked again; the typed fields are kept.
+            # The pool, exclusions and checkboxes have to be picked again; the typed fields are kept.
             await interaction.response.send_message(
                 f"Not created: {e}", view=RetryView(lambda: CreateGroupsModal(self.db, typed)), ephemeral=True
             )
