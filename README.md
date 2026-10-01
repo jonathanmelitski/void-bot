@@ -95,31 +95,22 @@ The bot's role needs the **Manage Channels** permission for this. Set `GROUP_CAT
 
 ## Throwing sessions
 
-Set `THROWING_CHANNEL_ID` and `ANTHROPIC_API_KEY` in `.env`. The channel stays a normal conversation, and the bot quietly picks out the reports. Examples: "threw 45 min with @Sam and Max", or "hour and a half of hucks with Jess yesterday".
+Set `THROWING_CHANNEL_ID` and `ANTHROPIC_API_KEY` in `.env`. The bot does nothing in the channel until someone @mentions it there. It doesn't read or keep messages in the meantime, and it ignores mentions anywhere else.
 
-- **The transcript:** the bot keeps the last hour of the channel in memory. It includes the bot's own replies and any private back-and-forth, and each message is marked if it's been logged, asked about, or dropped. On startup, the bot reloads the last hour from the channel's history and uses the database to see what was already logged.
-- **Reading it:** after a few seconds with no new messages, Claude Haiku 4.5 reads the whole transcript and returns only the reports that haven't been logged. Because it sees the conversation, "Nice job!" under a report counts as a reaction, and "me too, 30 min" as part of the report.
-- **Complete reports** are saved and the bot reacts ✅. It only posts a reply if the report asks the bot something it can answer. Questions meant for teammates don't count.
-- **Incomplete reports:** if the minutes are missing, or a name is ambiguous (two Maxes) or unknown, the bot DMs the reporter a question. If their DMs are closed, it asks in the channel.
-  - The answer, whether in DM or in the channel, goes into the transcript for the next pass.
-  - After 3 questions without an answer that settles it, the bot gives up. Saying "cancel" drops the report.
-  - Anything older than an hour falls out of the transcript.
-- **Errors** are logged, and the next message in the channel triggers a retry.
+When it's tagged:
 
-The reporter is counted as a participant unless they say otherwise. Claude looks names up with the same `find_members` tool the @mention assistant uses. It matches display names, nicknames, usernames and the names in the player database. If a name matches several people or nobody, the bot asks the reporter. `CLAUDE_MODEL` changes the model.
+1. It fetches the last hour of the channel (up to 200 messages) and Claude Haiku 4.5 picks out the throwing reports that aren't logged yet. Examples: "threw 45 min with" followed by an @mention or a name, or "hour and a half of hucks yesterday". The tag can be the report itself, or just a nudge to pick up earlier ones.
+2. **Complete reports** are saved and the bot reacts ✅ on the report. It posts nothing in the channel.
+3. **Incomplete reports:** if the minutes are missing, or a name is ambiguous (it matches two people) or unknown, the bot starts a private thread that only it and the reporter are in, and asks there with a link to the report. The mention is silent. A report that already has a thread doesn't get a second one.
+4. **Answers:** the bot reads messages posted in those threads, without needing a tag. Once the report is complete it's logged and the thread is deleted. It asks at most 3 questions per report. Saying "cancel" drops it; that thread archives itself after an hour.
 
-Tables: `throwing_sessions` (UUID `id`, `occurred_at`, `minutes`, `description`, `reported_by`, `source_message_id`) and `session_participants` (`session_id`, `discord_id`).
+A report nobody tags the bot about within an hour isn't picked up. If something goes wrong, the bot reacts ⚠️ on the message that triggered it and logs the error.
 
-## Asking Void Bot
+The reporter is counted as a participant unless they say otherwise. Claude looks names up with a `find_members` tool that matches display names, nicknames, usernames and the names in the player database; it can't see emails, phone numbers or Penn IDs. `CLAUDE_MODEL` changes the model.
 
-@mention the bot in any channel it can read to ask about logged throwing, or to log a session. Replying to one of its answers continues the conversation.
+The bot's role needs these permissions in the channel: **View Channel**, **Read Message History**, **Add Reactions**, **Create Private Threads**, **Send Messages in Threads** and **Manage Threads** (to delete a thread once its report is logged; without it the thread is left to archive).
 
-- "how much did @Max throw this week?"
-- "who threw the most in September?"
-- "what sessions did I do yesterday?"
-- "log 30 min for me and Sam, break throws"
-
-Claude (`CLAUDE_MODEL`) answers using four fixed tools: find members by name, total minutes per person over a date range, list sessions, and log a session. It never writes SQL. Each tool runs one parameterized query, and every argument is validated before it reaches the database. The tools can't see emails, phone numbers or Penn IDs, and can't edit or delete sessions. Anyone can ask or log, the same as posting in the throwing channel. A manual log is tied to the message that asked for it, so one message can't log the same session twice. The throwing-channel logger skips messages that mention the bot.
+Tables: `throwing_sessions` (UUID `id`, `occurred_at`, `minutes`, `description`, `reported_by`, `source_message_id`) and `session_participants` (`session_id`, `discord_id`). `report_threads` maps a report's message ID to the open question thread about it, and holds IDs only. There's no command for viewing totals yet.
 
 ## Adding a command
 

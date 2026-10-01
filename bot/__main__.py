@@ -19,7 +19,7 @@ class VoidBot(commands.Bot):
         # Needed to see who has a role (for /player import). Must also be enabled in the
         # Developer Portal: Bot -> Privileged Gateway Intents -> Server Members Intent.
         intents.members = True
-        # Needed to read throwing reports. Also a privileged intent: enable
+        # Needed to read throwing reports when the bot is tagged. Also a privileged intent: enable
         # Bot -> Privileged Gateway Intents -> Message Content Intent.
         intents.message_content = True
         super().__init__(command_prefix=commands.when_mentioned, intents=intents)
@@ -57,7 +57,7 @@ class VoidBot(commands.Bot):
     async def on_message(self, message: discord.Message):
         # All commands are slash commands. Skip discord.py's text-command parsing, which would
         # otherwise treat "@Void Bot when ..." as a call to a command named "when" and log
-        # CommandNotFound. Cog listeners (the @mention assistant, throwing logger) still get every message.
+        # CommandNotFound. Cog listeners (the throwing logger) still get every message.
         pass
 
     async def on_app_command_error(

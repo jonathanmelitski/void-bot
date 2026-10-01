@@ -37,6 +37,13 @@ MIGRATIONS = [
     );
     CREATE INDEX session_participants_by_user ON session_participants(discord_id);
     """,
+    """
+    CREATE TABLE report_threads (
+        message_id  INTEGER PRIMARY KEY,                   -- the report being asked about
+        thread_id   INTEGER NOT NULL UNIQUE,               -- the bot's private thread with the reporter
+        created_at  TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+    """,
 ]
 
 
@@ -194,6 +201,45 @@ class Database:
         ) as cur:
             row = await cur.fetchone()
         return row["id"] if row else None
+
+    async def logged_message_ids(self, message_ids: list[int]) -> set[int]:
+        """Which of these messages already have a session logged from them."""
+        if not message_ids:
+            return set()
+        async with self.conn.execute(
+            "SELECT source_message_id FROM throwing_sessions "
+            f"WHERE source_message_id IN ({', '.join('?' for _ in message_ids)})",
+            message_ids,
+        ) as cur:
+            return {row["source_message_id"] for row in await cur.fetchall()}
+
+    async def report_threads(self, message_ids: list[int]) -> dict[int, int]:
+        """Report message ID -> the thread asking about it, for those that have one."""
+        if not message_ids:
+            return {}
+        async with self.conn.execute(
+            "SELECT message_id, thread_id FROM report_threads "
+            f"WHERE message_id IN ({', '.join('?' for _ in message_ids)})",
+            message_ids,
+        ) as cur:
+            return {row["message_id"]: row["thread_id"] for row in await cur.fetchall()}
+
+    async def report_for_thread(self, thread_id: int) -> int | None:
+        async with self.conn.execute(
+            "SELECT message_id FROM report_threads WHERE thread_id = ?", (thread_id,)
+        ) as cur:
+            row = await cur.fetchone()
+        return row["message_id"] if row else None
+
+    async def add_report_thread(self, message_id: int, thread_id: int):
+        await self.conn.execute(
+            "INSERT OR REPLACE INTO report_threads (message_id, thread_id) VALUES (?, ?)", (message_id, thread_id)
+        )
+        await self.conn.commit()
+
+    async def remove_report_thread(self, message_id: int):
+        await self.conn.execute("DELETE FROM report_threads WHERE message_id = ?", (message_id,))
+        await self.conn.commit()
 
     async def log_session(
         self,

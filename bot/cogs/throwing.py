@@ -1,15 +1,17 @@
-"""Logs throwing sessions reported in a channel, using Claude to read the conversation.
+"""Logs throwing sessions reported in a channel, but only when someone tags the bot there.
 
-The bot keeps the last hour of THROWING_CHANNEL_ID in memory as a transcript, including its own
-replies and any private back-and-forth, with each message marked if it's been logged. Shortly after
-people stop typing, Claude reads the transcript and returns reports that haven't been logged yet.
-Complete ones are logged; for incomplete ones the reporter is asked privately (DM, or a reply in the
-channel if their DMs are closed), and their answer goes into the transcript for the next pass.
+Nothing is read or kept between tags. When the bot is @mentioned in THROWING_CHANNEL_ID it fetches
+the last hour of that channel, and Claude picks out the reports that haven't been logged. Complete
+ones are logged and get a ✅. For an incomplete one the bot starts a private thread with the
+reporter and asks there; messages in those threads are read as they arrive, and once the report is
+complete it's logged and the thread is deleted. The bot never posts in the channel itself and never
+DMs anyone.
 """
 
 import asyncio
 import logging
-from dataclasses import dataclass
+import re
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
@@ -22,40 +24,26 @@ from ..session_parser import FoundReport, ParseFailed, SessionParser
 
 log = logging.getLogger(__name__)
 
-TRANSCRIPT_TTL = timedelta(hours=1)
-MAX_TRANSCRIPT_MESSAGES = 300
-QUIET_SECONDS = 8  # wait for a pause in the conversation before reading it
+WINDOW = timedelta(hours=1)
+MAX_MESSAGES = 200
+MAX_THREAD_MESSAGES = 50
 MAX_QUESTIONS = 3
 MAX_MINUTES = 24 * 60
-# Statuses of messages that are done with. "handled" = it @mentioned the bot, so the assistant
-# (cogs/assistant.py) answered it, including any manual logging.
-CLOSED = ("logged", "gave up", "dropped", "handled")
+TEXT_TYPES = (discord.MessageType.default, discord.MessageType.reply)
+NEEDED_PERMISSIONS = [
+    "view_channel", "read_message_history", "add_reactions", "create_private_threads", "send_messages_in_threads",
+    "manage_threads",  # to delete a question thread once its report is logged
+]
 
 
 @dataclass
-class Entry:
-    at: datetime
-    author_id: int
-    author_name: str
-    content: str
-    message: discord.Message | None = None  # None for private (DM) lines
-    reply_to: int | None = None
-    is_bot: bool = False
-    status: str | None = None  # "asked: ..." or one of CLOSED
+class Item:
+    """A message in the throwing channel, with the bot's question thread about it if there is one."""
 
-    @property
-    def id(self) -> int | None:
-        return self.message.id if self.message else None
-
-
-@dataclass
-class Asked:
-    """A report we've asked its author about."""
-
-    reporter: discord.abc.User
-    questions: int = 0
-    awaiting_answer: bool = False
-    via_dm: bool = True
+    message: discord.Message
+    logged: bool = False
+    thread: discord.Thread | None = None
+    replies: list[discord.Message] = field(default_factory=list)  # the thread's messages
 
 
 class Throwing(commands.Cog):
@@ -63,199 +51,121 @@ class Throwing(commands.Cog):
         self.bot = bot
         self.parser = SessionParser(config.CLAUDE_MODEL)
         self.tz = ZoneInfo(config.TIMEZONE)
-        self.transcript: list[Entry] = []
-        self.asked: dict[int, Asked] = {}  # report's first message ID -> question state
         self.lock = asyncio.Lock()
-        self.pending_analysis: asyncio.Task | None = None
-        self.backfilled = False
 
     @property
     def db(self):
         return self.bot.db
 
-    # ---- keeping the transcript ----
-
-    def _prune(self):
-        cutoff = datetime.now(timezone.utc) - TRANSCRIPT_TTL
-        self.transcript = [e for e in self.transcript if e.at >= cutoff][-MAX_TRANSCRIPT_MESSAGES:]
-        live = {e.id for e in self.transcript}
-        self.asked = {k: v for k, v in self.asked.items() if k in live}
-
-    def _entry(self, message_id: int) -> Entry | None:
-        return next((e for e in self.transcript if e.id == message_id), None)
-
-    def _add_message(self, message: discord.Message, status: str | None = None):
-        if self._entry(message.id):
-            return
-        ref = message.reference
-        self.transcript.append(
-            Entry(
-                at=message.created_at,
-                author_id=message.author.id,
-                author_name=message.author.display_name,
-                content=message.content or "(attachment)",
-                message=message,
-                reply_to=ref.message_id if ref else None,
-                is_bot=message.author == self.bot.user,
-                status=status,
-            )
-        )
-        self.transcript.sort(key=lambda e: e.at)
-
-    def _add_private(self, author: discord.abc.User, text: str):
-        self.transcript.append(
-            Entry(at=datetime.now(timezone.utc), author_id=author.id, author_name=author.display_name, content=text)
-        )
-
     @commands.Cog.listener()
     async def on_ready(self):
-        if self.backfilled:
-            return
-        self.backfilled = True
         channel = self.bot.get_channel(config.THROWING_CHANNEL_ID)
         if channel is None:
             log.warning("Throwing channel %s not found or not visible to the bot", config.THROWING_CHANNEL_ID)
             return
         perms = channel.permissions_for(channel.guild.me)
-        needed = ["view_channel", "read_message_history", "send_messages", "add_reactions"]
-        if missing := [p for p in needed if not getattr(perms, p)]:
+        if missing := [p for p in NEEDED_PERMISSIONS if not getattr(perms, p)]:
             log.error(
                 "Missing permissions in #%s: %s. Add the bot's role to the channel (Edit Channel -> "
                 "Permissions) and allow them.",
                 channel.name,
                 ", ".join(missing),
             )
-            if "view_channel" in missing or "read_message_history" in missing:
-                return
-        after = datetime.now(timezone.utc) - TRANSCRIPT_TTL
-        count = 0
-        try:
-            async for message in channel.history(after=after, oldest_first=True, limit=MAX_TRANSCRIPT_MESSAGES):
-                if message.author.bot and message.author != self.bot.user:
-                    continue
-                logged = await self.db.session_for_message(message.id)
-                self._add_message(message, status="logged" if logged else None)
-                count += 1
-        except discord.Forbidden as e:
-            log.error("Couldn't read #%s history: %s", channel.name, e)
-            return
-        log.info("Loaded %d message(s) from the last hour of the throwing channel", count)
-        if count:
-            self._schedule_analysis()
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
-        if message.author.bot and message.author != self.bot.user:
+        # The only two things the bot acts on. Every other message is ignored without being read.
+        if message.author.bot or message.guild is None:
             return
-        if message.guild is None:
-            if message.author != self.bot.user:
-                await self._handle_dm(message)
-            return
-        if message.channel.id != config.THROWING_CHANNEL_ID:
-            return
+        channel = message.channel
+        if channel.id == config.THROWING_CHANNEL_ID:
+            if self.bot.user in message.mentions:
+                await self._run(message, lambda: self._scan_channel(channel))
+        elif (
+            isinstance(channel, discord.Thread)
+            and channel.parent_id == config.THROWING_CHANNEL_ID
+            and channel.owner_id == self.bot.user.id
+        ):
+            # Private threads aren't attached to a message; the database says which report each is about.
+            if report_id := await self.db.report_for_thread(channel.id):
+                await self._run(message, lambda: self._scan_thread(report_id))
 
-        self._add_message(message, status="handled" if self.bot.user in message.mentions else None)
-        if message.author == self.bot.user:
-            return  # our own confirmations/questions are context, not a reason to re-read
-        # If we asked in the channel (their DMs are closed), anything they say there may be the answer.
-        # If we asked by DM, only a DM reply counts; otherwise ordinary chatter from the reporter could
-        # make a still-open report look cancelled. (An answer given in the channel anyway is still in
-        # the transcript, so the report gets logged once it's complete.)
-        for asked in self.asked.values():
-            if asked.reporter.id == message.author.id and not asked.via_dm:
-                asked.awaiting_answer = False
-        self._schedule_analysis()
-
-    @commands.Cog.listener()
-    async def on_raw_message_edit(self, payload: discord.RawMessageUpdateEvent):
-        entry = self._entry(payload.message_id)
-        if entry and not entry.is_bot and "content" in payload.data:
-            entry.content = payload.data["content"] or "(attachment)"
-            self._schedule_analysis()
-
-    @commands.Cog.listener()
-    async def on_raw_message_delete(self, payload: discord.RawMessageDeleteEvent):
-        self.transcript = [e for e in self.transcript if e.id != payload.message_id]
-
-    async def _handle_dm(self, message: discord.Message):
-        waiting = [a for a in self.asked.values() if a.reporter.id == message.author.id and a.via_dm]
-        if not waiting:
-            return
-        for asked in waiting:
-            asked.awaiting_answer = False
-        self._add_private(message.author, f"[private] {message.author.display_name} replied to the bot: {message.content}")
-        self._schedule_analysis()
-
-    # ---- reading the transcript ----
-
-    def _schedule_analysis(self):
-        """Read the transcript once the conversation has been quiet for a few seconds."""
-        if self.pending_analysis and not self.pending_analysis.done():
-            self.pending_analysis.cancel()
-        self.pending_analysis = asyncio.create_task(self._analyze_after_pause())
-
-    async def _analyze_after_pause(self):
-        await asyncio.sleep(QUIET_SECONDS)
+    async def _run(self, trigger: discord.Message, scan):
         async with self.lock:
             try:
-                await self._analyze()
+                await scan()
+            except ParseFailed as e:
+                log.error("Couldn't read the throwing channel: %s", e)
+                await self._react(trigger, "⚠️")
             except Exception:
-                log.exception("Error analyzing the throwing channel")
+                log.exception("Error handling %s", trigger.jump_url)
+                await self._react(trigger, "⚠️")
 
-    async def _analyze(self):
-        self._prune()
-        if not any(not e.is_bot for e in self.transcript):
-            return
+    # ---- reading the channel ----
+
+    async def _scan_channel(self, channel: discord.TextChannel):
+        """Tagged in the channel: go through the last hour."""
+        after = datetime.now(timezone.utc) - WINDOW
+        messages = [m async for m in channel.history(after=after, limit=MAX_MESSAGES, oldest_first=False)]
+        await self._process(channel.guild, messages[::-1])
+
+    async def _scan_thread(self, report_id: int):
+        """Someone wrote in one of the bot's question threads: go through that one report, however old it is."""
         channel = self.bot.get_channel(config.THROWING_CHANNEL_ID)
-        if not channel.guild.chunked:
-            await channel.guild.chunk()
         try:
-            reports = await self.parser.find_reports(self._prompt(), [find_members_tool(channel.guild, self.db)])
-        except ParseFailed as e:
-            log.error("Couldn't read the throwing channel: %s", e)
+            report = await channel.fetch_message(report_id)
+        except discord.NotFound:
+            return
+        await self._process(channel.guild, [report])
+
+    async def _process(self, guild: discord.Guild, messages: list[discord.Message]):
+        ids = [m.id for m in messages]
+        logged = await self.db.logged_message_ids(ids)
+        threads = await self.db.report_threads(ids)
+        items = {}
+        for message in messages:
+            if message.author.bot or message.type not in TEXT_TYPES:
+                continue
+            item = Item(message, logged=message.id in logged)
+            if not item.logged and message.id in threads:
+                await self._load_thread(item, threads[message.id])
+            items[message.id] = item
+        if all(item.logged for item in items.values()):
             return
 
-        log.info("Claude found %d report(s) in %d transcript line(s)", len(reports), len(self.transcript))
-        for n, report in enumerate(reports, 1):
-            for message_id in report.message_ids:
-                entry = self._entry(message_id)
-                if entry:
-                    log.info("  report %d: msg %s from %s (id=%s): %r", n, message_id, entry.author_name, entry.author_id, entry.content[:100])
-                else:
-                    log.info("  report %d: msg %s (not in transcript)", n, message_id)
-            log.info(
-                "  report %d: minutes=%s participants=%s description=%r question=%r",
-                n, report.minutes, report.participant_ids, report.description, report.question,
-            )
-
-        found = set()
+        if not guild.chunked:
+            await guild.chunk()
+        reports = await self.parser.find_reports(self._prompt(items), [find_members_tool(guild, self.db)])
+        log.info("Claude found %d report(s) in %d message(s)", len(reports), len(items))
         for report in reports:
-            if key := await self._handle_report(report, channel.guild):
-                found.add(key)
+            await self._handle_report(report, items, guild)
 
-        # A report we asked about that's no longer being returned, after the reporter replied,
-        # was cancelled or turned out not to be a session.
-        for key, asked in list(self.asked.items()):
-            if key not in found and not asked.awaiting_answer:
-                del self.asked[key]
-                if entry := self._entry(key):
-                    entry.status = "dropped"
-                if asked.via_dm:
-                    await self._dm(asked.reporter, "OK, I won't log that one.")
-
-    async def _handle_report(self, report: FoundReport, guild: discord.Guild) -> int | None:
-        """Log or ask about one report. Returns the report's key (first message ID) if it's still open."""
-        # Only unlogged human channel messages can make up a report.
-        entries = [
-            e for i in dict.fromkeys(report.message_ids)
-            if (e := self._entry(i)) and not e.is_bot and e.status not in CLOSED
+    async def _load_thread(self, item: Item, thread_id: int):
+        message = item.message
+        try:
+            thread = message.guild.get_thread(thread_id) or await message.guild.fetch_channel(thread_id)
+            replies = [m async for m in thread.history(limit=MAX_THREAD_MESSAGES, oldest_first=False)]
+        except discord.NotFound:
+            await self.db.remove_report_thread(message.id)  # someone deleted it; ask again in a new one
+            return
+        except discord.HTTPException as e:
+            log.warning("Couldn't read the thread about %s: %s", message.jump_url, e)
+            return
+        item.thread = thread
+        item.replies = [
+            m for m in replies[::-1]
+            if m.type in TEXT_TYPES and (not m.author.bot or m.author == self.bot.user)
         ]
-        if not entries:
-            return None
-        first = min(entries, key=lambda e: e.at)
-        if await self.db.session_for_message(first.id):
-            first.status = "logged"
-            return None
+
+    async def _handle_report(self, report: FoundReport, items: dict[int, Item], guild: discord.Guild):
+        """Log one report, or ask about it."""
+        found = [item for i in dict.fromkeys(report.message_ids) if (item := items.get(i)) and not item.logged]
+        if not found:
+            return
+        first = min(found, key=lambda item: item.message.created_at)
+        if await self.db.session_for_message(first.message.id):
+            first.logged = True
+            return
 
         participants = [
             i for i in dict.fromkeys(report.participant_ids) if (m := guild.get_member(i)) and not m.bot
@@ -273,87 +183,65 @@ class Throwing(commands.Cog):
 
         if question:
             await self._ask(first, question)
-            return first.id
-        await self._log(first, entries, report, participants)
-        return None
+        else:
+            await self._log(first, report, participants)
 
-    async def _log(self, first: Entry, entries: list[Entry], report: FoundReport, participants: list[int]):
-        message = first.message
-        when = self._occurred_at(report.occurred_at, message.created_at)
+    async def _log(self, item: Item, report: FoundReport, participants: list[int]):
+        message = item.message
         session_id = await self.db.log_session(
-            occurred_at=when,
+            occurred_at=self._occurred_at(report.occurred_at, message.created_at),
             minutes=report.minutes,
             description=report.description,
             participant_ids=participants,
-            reported_by=first.author_id,
-            source_message_id=first.id,
+            reported_by=message.author.id,
+            source_message_id=message.id,
         )
-        for e in entries:
-            e.status = "logged"
+        item.logged = True
         log.info("Logged session %s: %d min, %d people, from %s", session_id, report.minutes, len(participants), message.jump_url)
-
-        summary = f"Logged **{report.minutes} min** for {', '.join(f'<@{i}>' for i in participants)}"
-        if report.description:
-            summary += f": {report.description}"
-        local = when.astimezone(self.tz)
-        if local.date() != message.created_at.astimezone(self.tz).date():
-            summary += f" ({local:%a %b} {local.day})"
-        # The ✅ is the confirmation. Only reply when Claude has something to answer.
-        await self._react(message, "✅")
-        if report.reply:
+        await self._react(message, "✅")  # the only confirmation
+        if item.thread:
             try:
-                await message.reply(
-                    report.reply[:2000], mention_author=False, allowed_mentions=discord.AllowedMentions.none()
+                await item.thread.delete()
+            except discord.HTTPException as e:
+                log.warning("Couldn't delete the thread about %s (needs Manage Threads): %s", message.jump_url, e)
+            await self.db.remove_report_thread(message.id)
+
+    async def _ask(self, item: Item, question: str):
+        """Ask the reporter in a private thread only they and the bot are in."""
+        message, thread = item.message, item.thread
+        text = f"<@{message.author.id}> {question}"
+        if thread is None:
+            try:
+                thread = await message.channel.create_thread(
+                    name=f"{message.author.display_name}'s throwing session"[:100],
+                    type=discord.ChannelType.private_thread,
+                    auto_archive_duration=60,
                 )
             except discord.HTTPException as e:
-                log.warning("Couldn't reply to %s: %s", message.jump_url, e)
-
-        asked = self.asked.pop(first.id, None)
-        if asked and asked.via_dm:
-            await self._dm(asked.reporter, f"Thanks! {summary}.")
-
-    async def _ask(self, first: Entry, question: str):
-        message = first.message
-        asked = self.asked.setdefault(first.id, Asked(reporter=message.author))
-        if asked.awaiting_answer:
+                log.warning("Couldn't start a thread about %s: %s", message.jump_url, e)
+                return
+            await self.db.add_report_thread(message.id, thread.id)
+            item.thread = thread
+            text += f" {message.jump_url}"  # the thread isn't attached to the report, so link it
+        elif item.replies and item.replies[-1].author == self.bot.user:
             return  # already asked; wait for them
-        if asked.questions >= MAX_QUESTIONS:
-            first.status = "gave up"
-            del self.asked[first.id]
-            text = (
-                "I still couldn't work out that throwing session, so I didn't log it. Try posting it "
-                "again with @mentions and the number of minutes."
-            )
-            if asked.via_dm:
-                await self._dm(asked.reporter, text)
-            else:
-                await message.reply(text, mention_author=False)
+        elif sum(m.author == self.bot.user for m in item.replies) >= MAX_QUESTIONS:
+            log.info("Giving up on %s after %d questions", message.jump_url, MAX_QUESTIONS)
             return
 
-        asked.questions += 1
-        asked.awaiting_answer = True
-        first.status = f"asked: {question}"
         try:
-            await message.author.send(
-                f"Quick question about your throwing report {message.jump_url}\n> {question}\n\n"
-                'Just reply here, or say "cancel" to skip it.'
+            # Mentioning the reporter adds them to the thread; silent, so it doesn't notify them.
+            sent = await thread.send(
+                text[:2000],
+                silent=True,
+                allowed_mentions=discord.AllowedMentions(users=[message.author]),
             )
-            asked.via_dm = True
-            self._add_private(
-                self.bot.user, f"[private] void-bot asked {message.author.display_name} about msg {first.id}: {question}"
-            )
-        except discord.Forbidden:
-            # DMs closed: ask in the channel. Their answer will show up in the transcript.
-            asked.via_dm = False
-            await message.reply(f"{question}\n-# Answer here, or say \"cancel\".")
+        except discord.HTTPException as e:
+            log.warning("Couldn't ask in the thread about %s: %s", message.jump_url, e)
+            return
+        item.replies.append(sent)
 
     # ---- helpers ----
-
-    async def _dm(self, user: discord.abc.User, text: str):
-        try:
-            await user.send(text)
-        except discord.HTTPException as e:
-            log.warning("Couldn't DM %s: %s", user, e)
 
     @staticmethod
     async def _react(message: discord.Message, emoji: str):
@@ -362,23 +250,28 @@ class Throwing(commands.Cog):
         except discord.HTTPException as e:
             log.warning("Couldn't react to %s: %s", message.jump_url, e)
 
-    def _prompt(self) -> str:
+    def _line(self, message: discord.Message) -> str:
+        at = message.created_at.astimezone(self.tz)
+        if message.author == self.bot.user:
+            who = "void-bot (the bot)"
+        else:
+            who = f"{message.author.display_name} (id={message.author.id})"
+        content = re.sub(rf"<@!?{self.bot.user.id}>", "@void-bot", message.content) or "(attachment)"
+        return f"{at:%a %H:%M} {who}: {content}"
+
+    def _prompt(self, items: dict[int, Item]) -> str:
         now = datetime.now(timezone.utc).astimezone(self.tz)
         lines = []
-        for e in self.transcript:
-            at = e.at.astimezone(self.tz)
-            stamp = f"{at:%a %H:%M}"
-            if e.message is None:
-                lines.append(f"{stamp} {e.content}")
-                continue
-            who = "void-bot (the bot)" if e.is_bot else f"{e.author_name} (id={e.author_id})"
-            reply = f", replying to msg {e.reply_to}" if e.reply_to else ""
-            lines.append(f"[msg {e.id}] {stamp} {who}{reply}: {e.content}")
-            if e.status:
-                lines.append(f"    -> {e.status}")
+        for item in items.values():
+            ref = item.message.reference
+            reply = f" (replying to msg {ref.message_id})" if ref and ref.message_id else ""
+            lines.append(f"[msg {item.message.id}]{reply} {self._line(item.message)}")
+            if item.logged:
+                lines.append("    -> logged")
+            lines += [f"    thread> {self._line(m)}" for m in item.replies]
         return (
             f"Now: {now.isoformat()} ({now:%A}, time zone {config.TIMEZONE})\n\n"
-            "Transcript (last hour, oldest first):\n<transcript>\n" + "\n".join(lines) + "\n</transcript>"
+            "Transcript (oldest first):\n<transcript>\n" + "\n".join(lines) + "\n</transcript>"
         )
 
     def _occurred_at(self, raw: str | None, sent: datetime) -> datetime:
@@ -405,4 +298,4 @@ async def setup(bot: commands.Bot):
         log.warning("Throwing-session logging off: THROWING_CHANNEL_ID is set but ANTHROPIC_API_KEY isn't")
         return
     await bot.add_cog(Throwing(bot))
-    log.info("Logging throwing sessions from channel %s with %s", config.THROWING_CHANNEL_ID, config.CLAUDE_MODEL)
+    log.info("Logging throwing sessions when tagged in channel %s, with %s", config.THROWING_CHANNEL_ID, config.CLAUDE_MODEL)
