@@ -2,9 +2,9 @@
 
 Nothing is read or kept between tags. When the bot is @mentioned in THROWING_CHANNEL_ID it fetches
 the last hour of that channel, and Claude picks out the reports that haven't been logged. Complete
-ones are logged and get a ✅. For an incomplete one the bot starts a private thread with the
-reporter and asks there; messages in those threads are read as they arrive, and once the report is
-complete it's logged and the thread is deleted. The bot never posts in the channel itself and never
+ones are logged and get a reaction. For an incomplete one the bot starts a thread on the report and
+asks there; messages in those threads are read as they arrive, and once the report is complete it's
+logged and the thread is deleted. The bot never posts in the channel itself and never
 DMs anyone.
 """
 
@@ -31,7 +31,7 @@ MAX_QUESTIONS = 3
 MAX_MINUTES = 24 * 60
 TEXT_TYPES = (discord.MessageType.default, discord.MessageType.reply)
 NEEDED_PERMISSIONS = [
-    "view_channel", "read_message_history", "add_reactions", "create_private_threads", "send_messages_in_threads",
+    "view_channel", "read_message_history", "add_reactions", "create_public_threads", "send_messages_in_threads",
     "manage_threads",  # to delete a question thread once its report is logged
 ]
 
@@ -86,7 +86,7 @@ class Throwing(commands.Cog):
             and channel.parent_id == config.THROWING_CHANNEL_ID
             and channel.owner_id == self.bot.user.id
         ):
-            # Private threads aren't attached to a message; the database says which report each is about.
+            # The database says which report each of the bot's threads is about.
             if report_id := await self.db.report_for_thread(channel.id):
                 await self._run(message, lambda: self._scan_thread(report_id))
 
@@ -198,7 +198,7 @@ class Throwing(commands.Cog):
         )
         item.logged = True
         log.info("Logged session %s: %d min, %d people, from %s", session_id, report.minutes, len(participants), message.jump_url)
-        await self._react(message, "✅")  # the only confirmation
+        await self._confirm(message, report.minutes)
         if item.thread:
             try:
                 await item.thread.delete()
@@ -207,22 +207,18 @@ class Throwing(commands.Cog):
             await self.db.remove_report_thread(message.id)
 
     async def _ask(self, item: Item, question: str):
-        """Ask the reporter in a private thread only they and the bot are in."""
+        """Ask the reporter in a thread on their report."""
         message, thread = item.message, item.thread
-        text = f"<@{message.author.id}> {question}"
         if thread is None:
             try:
-                thread = await message.channel.create_thread(
-                    name=f"{message.author.display_name}'s throwing session"[:100],
-                    type=discord.ChannelType.private_thread,
-                    auto_archive_duration=60,
+                thread = await message.create_thread(
+                    name=f"{message.author.display_name}'s throwing session"[:100], auto_archive_duration=60
                 )
-            except discord.HTTPException as e:
-                log.warning("Couldn't start a thread about %s: %s", message.jump_url, e)
+            except discord.HTTPException as e:  # e.g. someone already started their own thread on it
+                log.warning("Couldn't start a thread on %s: %s", message.jump_url, e)
                 return
             await self.db.add_report_thread(message.id, thread.id)
             item.thread = thread
-            text += f" {message.jump_url}"  # the thread isn't attached to the report, so link it
         elif item.replies and item.replies[-1].author == self.bot.user:
             return  # already asked; wait for them
         elif sum(m.author == self.bot.user for m in item.replies) >= MAX_QUESTIONS:
@@ -232,7 +228,7 @@ class Throwing(commands.Cog):
         try:
             # Mentioning the reporter adds them to the thread; silent, so it doesn't notify them.
             sent = await thread.send(
-                text[:2000],
+                f"<@{message.author.id}> {question}"[:2000],
                 silent=True,
                 allowed_mentions=discord.AllowedMentions(users=[message.author]),
             )
@@ -242,6 +238,18 @@ class Throwing(commands.Cog):
         item.replies.append(sent)
 
     # ---- helpers ----
+
+    async def _confirm(self, message: discord.Message, minutes: int):
+        """The only confirmation: the server's void_throw_<minutes> emote (scripts/make_emotes.py) if it
+        has one for exactly that many minutes, otherwise a ✅."""
+        emote = discord.utils.get(message.guild.emojis, name=f"void_throw_{minutes}")
+        if emote and emote.is_usable():
+            try:
+                await message.add_reaction(emote)
+                return
+            except discord.HTTPException as e:
+                log.warning("Couldn't react with :%s: on %s: %s", emote.name, message.jump_url, e)
+        await self._react(message, "✅")
 
     @staticmethod
     async def _react(message: discord.Message, emoji: str):

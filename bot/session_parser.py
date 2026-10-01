@@ -21,9 +21,8 @@ Transcript lines look like:
       thread> Wed 16:10 PlayerA (id=1): 45
   [msg 124] Wed 16:05 PlayerB (id=2): hour of hucks with <@1>
       -> logged
-[msg N] is a channel message. <@123> in text mentions user 123. "thread>" lines are the bot's \
-private thread about the message above them, where the bot (void-bot) asked about that report and \
-the reporter answered. \
+[msg N] is a channel message. <@123> in text mentions user 123. "thread>" lines are the thread \
+under the message above them, where the bot (void-bot) asked about that report and people answered. \
 "-> logged" means that message's session is already recorded. "@void-bot" in a message is someone \
 tagging the bot so that it reads the channel; the bot is never a participant, and a message that \
 only tags it isn't a report.

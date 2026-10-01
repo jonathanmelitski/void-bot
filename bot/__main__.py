@@ -7,7 +7,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from . import cogs, config
+from . import cogs, config, error_channel
 from .db import Database
 
 log = logging.getLogger("void-bot")
@@ -26,6 +26,13 @@ class VoidBot(commands.Bot):
         self.db = Database(config.DB_PATH)
 
     async def setup_hook(self):
+        # First, so errors from the rest of startup are queued and posted once the bot is connected.
+        if config.ERRORS_CHANNEL_ID:
+            error_channel.install(self)
+            log.info("Posting errors to channel %s", config.ERRORS_CHANNEL_ID)
+        else:
+            log.info("Not posting errors to Discord: ERRORS_CHANNEL_ID not set")
+
         await self.db.connect()
         log.info("Opened database at %s", config.DB_PATH)
         log.info("Admin roles: %s", sorted(config.ADMIN_ROLE_IDS) or "none (server admins only)")

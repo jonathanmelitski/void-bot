@@ -100,17 +100,25 @@ Set `THROWING_CHANNEL_ID` and `ANTHROPIC_API_KEY` in `.env`. The bot does nothin
 When it's tagged:
 
 1. It fetches the last hour of the channel (up to 200 messages) and Claude Haiku 4.5 picks out the throwing reports that aren't logged yet. Examples: "threw 45 min with" followed by an @mention or a name, or "hour and a half of hucks yesterday". The tag can be the report itself, or just a nudge to pick up earlier ones.
-2. **Complete reports** are saved and the bot reacts ✅ on the report. It posts nothing in the channel.
-3. **Incomplete reports:** if the minutes are missing, or a name is ambiguous (it matches two people) or unknown, the bot starts a private thread that only it and the reporter are in, and asks there with a link to the report. The mention is silent. A report that already has a thread doesn't get a second one.
+2. **Complete reports** are saved and the bot reacts on the report: with the server's `:void_throw_<minutes>:` emoji if there is one for exactly that many minutes (`:void_throw_45:` for 45), otherwise ✅. It posts nothing in the channel.
+3. **Incomplete reports:** if the minutes are missing, or a name is ambiguous (it matches two people) or unknown, the bot starts a thread on the report and asks there, mentioning the reporter silently. A report that already has a thread doesn't get a second one.
 4. **Answers:** the bot reads messages posted in those threads, without needing a tag. Once the report is complete it's logged and the thread is deleted. It asks at most 3 questions per report. Saying "cancel" drops it; that thread archives itself after an hour.
 
 A report nobody tags the bot about within an hour isn't picked up. If something goes wrong, the bot reacts ⚠️ on the message that triggered it and logs the error.
 
 The reporter is counted as a participant unless they say otherwise. Claude looks names up with a `find_members` tool that matches display names, nicknames, usernames and the names in the player database; it can't see emails, phone numbers or Penn IDs. `CLAUDE_MODEL` changes the model.
 
-The bot's role needs these permissions in the channel: **View Channel**, **Read Message History**, **Add Reactions**, **Create Private Threads**, **Send Messages in Threads** and **Manage Threads** (to delete a thread once its report is logged; without it the thread is left to archive).
+The bot's role needs these permissions in the channel: **View Channel**, **Read Message History**, **Add Reactions**, **Create Public Threads**, **Send Messages in Threads** and **Manage Threads** (to delete a thread once its report is logged; without it the thread is left to archive).
+
+The emoji come from `scripts/make_emotes.py`, which draws a flying disc with the minutes next to it for 5 to 180 minutes: `pipenv run pip install pillow`, `pipenv run python scripts/make_emotes.py`, then upload the PNGs in `emotes/` under **Server Settings → Emoji**. Discord names each emoji after its file. The bot works without them.
 
 Tables: `throwing_sessions` (UUID `id`, `occurred_at`, `minutes`, `description`, `reported_by`, `source_message_id`) and `session_participants` (`session_id`, `discord_id`). `report_threads` maps a report's message ID to the open question thread about it, and holds IDs only. There's no command for viewing totals yet.
+
+## Error channel
+
+Set `ERRORS_CHANNEL_ID` in `.env` and the bot posts everything it logs at error level to that channel, from any part of the bot: failed throwing scans, Claude API failures, slash-command crashes and uncaught exceptions, with the traceback. Warnings and info lines stay in `docker compose logs` only, and so does anything that goes wrong before the bot connects (a bad token, a missing variable) or while Discord is unreachable. During a burst of errors it posts about one a second and drops anything past 50 waiting.
+
+The bot needs **View Channel** and **Send Messages** there. Keep the channel admin-only, since tracebacks can include IDs and other details.
 
 ## Adding a command
 

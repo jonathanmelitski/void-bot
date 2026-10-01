@@ -40,7 +40,7 @@ MIGRATIONS = [
     """
     CREATE TABLE report_threads (
         message_id  INTEGER PRIMARY KEY,                   -- the report being asked about
-        thread_id   INTEGER NOT NULL UNIQUE,               -- the bot's private thread with the reporter
+        thread_id   INTEGER NOT NULL UNIQUE,               -- the bot's thread asking about it
         created_at  TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
     );
     """,

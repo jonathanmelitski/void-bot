@@ -1,0 +1,15 @@
+[[source]]
+url = "https://pypi.org/simple"
+verify_ssl = true
+name = "pypi"
+
+[packages]
+"discord.py" = "<3,>=2.7"
+aiosqlite = "<1,>=0.20"
+anthropic = "<2,>=1.10"
+tzdata = "*"
+
+[dev-packages]
+
+[requires]
+python_version = "3.11"
