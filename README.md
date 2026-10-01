@@ -123,6 +123,27 @@ Tables: `throwing_sessions` (UUID `id`, `occurred_at`, `minutes`, `description`,
 - Weeks start on Monday. A question with no time range is answered for all time.
 - The tools can't see emails, phone numbers or Penn IDs.
 
+## Superadmin requests
+
+Set `SUPERADMIN_ROLE_ID` and `SUPERADMIN_MANAGEMENT_CHANNEL_ID` in `.env` (and `ANTHROPIC_API_KEY`). Someone with that role can then @mention the bot in that channel and ask for a change to the database in plain English, such as purging players who have left the server, or changing a session's minutes and removing someone from it. Server administrators without the role can't use it.
+
+1. Claude (`SUPERADMIN_MODEL`, default `claude-opus-5-5`) looks at the database and writes the SQL. It can run any `SELECT`, on every table and column, so **emails, phone numbers and Penn IDs are sent to the Claude API** when a request touches them. It can also see who is currently in the server.
+2. The bot replies with what will change, the SQL, how many rows each statement would change (from a dry run that is rolled back), and **Confirm** and **Cancel** buttons.
+3. Nothing changes until a superadmin presses Confirm. Any superadmin can press it, not only the one who asked. Each plan runs at most once: the first press removes the buttons, and they expire after 10 minutes or when the bot restarts.
+4. On Confirm the bot copies the database to `data/backups/before-superadmin-<time>.db` (the newest 10 are kept), then runs the statements in one transaction. If any statement fails, none apply.
+
+If the request is unclear, the bot asks instead of offering buttons; reply to its message to answer. The only limit on the SQL is that it must be `INSERT`, `UPDATE` or `DELETE`: it can change or delete any rows, but not the tables themselves. Requests, the SQL and who confirmed are written to the log.
+
+To undo a run, stop the bot and copy the backup over the database:
+
+```sh
+docker compose stop
+docker compose run --rm --entrypoint sh bot -c 'cp data/backups/<file>.db data/players.db && rm -f data/players.db-wal data/players.db-shm'
+docker compose up -d
+```
+
+The bot needs **View Channel**, **Send Messages** and **Read Message History** in the management channel. Keep the channel private to superadmins: plans and answers can include anything in the database.
+
 ## Error channel
 
 Set `ERRORS_CHANNEL_ID` in `.env` and the bot posts everything it logs at error level to that channel, from any part of the bot: failed throwing scans, Claude API failures, slash-command crashes and uncaught exceptions, with the traceback. Warnings and info lines stay in `docker compose logs` only, and so does anything that goes wrong before the bot connects (a bad token, a missing variable) or while Discord is unreachable. During a burst of errors it posts about one a second and drops anything past 50 waiting.

@@ -97,6 +97,46 @@ class Database:
         await self.conn.execute("PRAGMA foreign_keys=ON")
         await self._migrate()
 
+    async def schema(self) -> str:
+        """The CREATE TABLE statements, as SQLite stores them."""
+        async with self.conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
+        ) as cur:
+            return "\n\n".join(row["sql"].strip() + ";" for row in await cur.fetchall())
+
+    async def read_only_query(self, sql: str, max_rows: int) -> tuple[list[str], list[tuple]]:
+        """Run one statement on a connection that can't write. Returns the column names and up to
+        max_rows + 1 rows (one extra, so the caller can tell there were more)."""
+        async with aiosqlite.connect(self.path) as conn:
+            await conn.execute("PRAGMA query_only = ON")
+            async with conn.execute(sql) as cur:
+                rows = await cur.fetchmany(max_rows + 1)
+                columns = [d[0] for d in cur.description or []]
+        return columns, [tuple(r) for r in rows]
+
+    async def run_statements(self, statements: list[str], *, commit: bool) -> list[int]:
+        """Run statements in one transaction and return the rows each one changed. With commit=False
+        it's a dry run: everything is rolled back. Uses its own connection, so the transaction can't
+        get mixed up with the bot's other writes."""
+        async with aiosqlite.connect(self.path, isolation_level=None) as conn:
+            await conn.execute("PRAGMA foreign_keys = ON")
+            await conn.execute("BEGIN IMMEDIATE")
+            try:
+                counts = []
+                for sql in statements:
+                    cur = await conn.execute(sql)
+                    counts.append(cur.rowcount)
+                await conn.execute("COMMIT" if commit else "ROLLBACK")
+            finally:
+                if conn.in_transaction:
+                    await conn.execute("ROLLBACK")
+        return counts
+
+    async def backup(self, path: str):
+        """Copy the whole database to another file. Safe while the bot is running."""
+        async with aiosqlite.connect(path) as target:
+            await self.conn.backup(target)
+
     async def close(self):
         if self.conn:
             await self.conn.close()

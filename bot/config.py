@@ -24,6 +24,14 @@ THROWING_CHANNEL_ID = int(os.environ["THROWING_CHANNEL_ID"]) if os.getenv("THROW
 ANTHROPIC_API_KEY_SET = bool(os.getenv("ANTHROPIC_API_KEY"))
 # Optional: channel that everything logged at ERROR or above is also posted to.
 ERRORS_CHANNEL_ID = int(os.environ["ERRORS_CHANNEL_ID"]) if os.getenv("ERRORS_CHANNEL_ID") else None
+# Superadmin requests: people with this role can @mention the bot in this channel to change the
+# database in plain English (cogs/superadmin.py). Disabled unless both are set.
+SUPERADMIN_ROLE_ID = int(os.environ["SUPERADMIN_ROLE_ID"]) if os.getenv("SUPERADMIN_ROLE_ID") else None
+SUPERADMIN_MANAGEMENT_CHANNEL_ID = (
+    int(os.environ["SUPERADMIN_MANAGEMENT_CHANNEL_ID"]) if os.getenv("SUPERADMIN_MANAGEMENT_CHANNEL_ID") else None
+)
+# Writing SQL that changes the database is worth the most capable model; it runs rarely.
+SUPERADMIN_MODEL = os.getenv("SUPERADMIN_MODEL", "claude-opus-5-5")
 # Pulling minutes and names out of a few messages is simple; the smallest model is plenty.
 CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-haiku-4-5")
 # Used to interpret "yesterday", "this morning", etc. in reports.

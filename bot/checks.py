@@ -27,6 +27,11 @@ def is_bot_admin(member: discord.Member) -> bool:
     return member.guild_permissions.administrator or any(r.id in config.ADMIN_ROLE_IDS for r in member.roles)
 
 
+def is_superadmin(member: discord.Member) -> bool:
+    """Has SUPERADMIN_ROLE_ID. Being a server administrator isn't enough."""
+    return any(r.id == config.SUPERADMIN_ROLE_ID for r in getattr(member, "roles", []))
+
+
 async def admin_only(interaction: discord.Interaction) -> bool:
     """Cog interaction_check for admin commands: server admins and ADMIN_ROLE_IDS only."""
     if not await bot_in_guild(interaction):
