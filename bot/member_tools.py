@@ -1,4 +1,4 @@
-"""Claude tool plumbing for the throwing-session logger.
+"""Claude tool plumbing shared by the throwing-session logger and /throwing query.
 
 Tools never run SQL that Claude wrote: they validate arguments here and call fixed queries.
 Member lookups return names only, never emails, phone numbers, or Penn IDs.
@@ -34,11 +34,28 @@ def logged_tool(fn):
     return wrapper
 
 
+def parse_id(value) -> int:
+    value = str(value).strip().removeprefix("<@").removeprefix("!").removesuffix(">")
+    if not value.isdigit():
+        raise ToolError(f"{value!r} isn't a Discord user ID. Use find_members to look people up.")
+    return int(value)
+
+
 async def _names_on_file(db) -> dict[int, str]:
     return {
         p.discord_id: name
         for p in await db.list_players()
         if (name := " ".join(filter(None, [p.first_name, p.last_name])))
+    }
+
+
+async def display_names(guild: discord.Guild, db) -> dict[int, str]:
+    """Discord ID -> "Display (First Last)" for every human member."""
+    on_file = await _names_on_file(db)
+    return {
+        m.id: f"{m.display_name} ({on_file[m.id]})" if m.id in on_file else m.display_name
+        for m in guild.members
+        if not m.bot
     }
 
 

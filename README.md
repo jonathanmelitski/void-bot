@@ -112,7 +112,16 @@ The bot's role needs these permissions in the channel: **View Channel**, **Read 
 
 The emoji come from `scripts/make_emotes.py`, which draws a flying disc with the minutes next to it for 5 to 180 minutes: `pipenv run pip install pillow`, `pipenv run python scripts/make_emotes.py`, then upload the PNGs in `emotes/` either to the bot's application (Developer Portal → your app → **Emojis**) or to the server (**Server Settings → Emoji**). Discord names each emoji after its file. The bot looks in the server first, then the application, and reads the application's list once at first use, so restart it after uploading more. It works without them.
 
-Tables: `throwing_sessions` (UUID `id`, `occurred_at`, `minutes`, `description`, `reported_by`, `source_message_id`) and `session_participants` (`session_id`, `discord_id`). `report_threads` maps a report's message ID to the open question thread about it, and holds IDs only. There's no command for viewing totals yet.
+Tables: `throwing_sessions` (UUID `id`, `occurred_at`, `minutes`, `description`, `reported_by`, `source_message_id`) and `session_participants` (`session_id`, `discord_id`). `report_threads` maps a report's message ID to the open question thread about it, and holds IDs only.
+
+### Asking about throwing
+
+`/throwing query question` answers a plain-English question about the logged sessions, for example "who has under 100 minutes this week?" or "how many sessions do" two named people "have this week compared to each other?". Like `/player`, only server admins and `ADMIN_ROLE_IDS` roles can use it, and the answer is only visible to the person who asked. It needs `ANTHROPIC_API_KEY`, but not `THROWING_CHANNEL_ID`.
+
+- Claude (`CLAUDE_MODEL`) answers using three read-only tools: find members by name, total minutes and sessions per person over a date range, and list sessions. It never writes SQL, each tool runs one fixed query, and nothing can add, change or delete a session.
+- "Everyone" means the roster: people in the player database who are still in the server, including those with nothing logged, plus anyone else with logged minutes. Run `/player import-role` first, or people with zero minutes can't show up.
+- Weeks start on Monday. A question with no time range is answered for all time.
+- The tools can't see emails, phone numbers or Penn IDs.
 
 ## Error channel
 
