@@ -41,6 +41,9 @@ gives no time range, use all time (start 2000-01-01, end tomorrow) and say so.
 - "People", "everyone", "the team" mean the roster. throwing_totals with no people returns the \
 whole roster, including people with nothing logged. For "less than", "under", "at least", "more \
 than" questions, use its below and at_least arguments rather than filtering the list yourself.
+- Throwing groups are sets of members with a start and end date. throwing_groups lists them with \
+the minutes and sessions that count for each group under that group's own rules, so use those \
+numbers for anything about a group's minutes rather than adding up its members' totals.
 - Keep answers short: a sentence, or a list with one person per line, most minutes first. Give the \
 minutes and the number of sessions when they're relevant, and say which dates you covered.
 - You only know about throwing sessions and people's names. You can't see emails, phone numbers, \
@@ -158,6 +161,26 @@ class ThrowingQuery(commands.GroupCog, group_name="throwing", group_description=
             ]
         }
 
+    async def _groups(self, guild: discord.Guild, include_ended: bool = False) -> dict:
+        names = await display_names(guild, self.db)
+        local = lambda iso: datetime.fromisoformat(iso).astimezone(self.tz).isoformat(timespec="minutes")
+        return {
+            "groups": [
+                {
+                    "id": g["id"],
+                    "name": g["name"],
+                    "start": local(g["starts_at"]),
+                    "end": local(g["ends_at"]),  # exclusive
+                    "members": [{"id": str(i), "name": names.get(i, "unknown")} for i in g["members"]],
+                    "minutes": g["minutes"],
+                    "sessions": g["sessions"],
+                    "counts_one_member_alone": g["count_solo"],
+                    "requires_all_members": g["require_all"],
+                }
+                for g in await self.db.list_groups(include_ended=bool(include_ended))
+            ]
+        }
+
     def _tools(self, guild: discord.Guild) -> list:
         """Read-only tools bound to this server. Each returns JSON, or an error string."""
 
@@ -191,7 +214,18 @@ class ThrowingQuery(commands.GroupCog, group_name="throwing", group_description=
             """
             return json.dumps(await self._sessions(guild, start, end, person, limit))
 
-        return [find_members_tool(guild, self.db), throwing_totals, list_sessions]
+        @beta_async_tool
+        @logged_tool
+        async def throwing_groups(include_ended: bool = False) -> str:
+            """Throwing groups: members, dates, and the minutes and sessions that count for each group.
+
+            Args:
+                include_ended: Also include groups whose end date has passed. By default only
+                    running and upcoming groups.
+            """
+            return json.dumps(await self._groups(guild, include_ended))
+
+        return [find_members_tool(guild, self.db), throwing_totals, list_sessions, throwing_groups]
 
 
 async def setup(bot: commands.Bot):

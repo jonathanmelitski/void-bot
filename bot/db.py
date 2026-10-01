@@ -44,6 +44,46 @@ MIGRATIONS = [
         created_at  TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
     );
     """,
+    """
+    CREATE TABLE throwing_groups (
+        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        name         TEXT NOT NULL,
+        starts_at    TEXT NOT NULL,                        -- ISO 8601, UTC; the group's life is [starts_at, ends_at)
+        ends_at      TEXT NOT NULL,
+        count_solo   INTEGER NOT NULL DEFAULT 0,           -- a session with only one of its members counts
+        require_all  INTEGER NOT NULL DEFAULT 0,           -- a session with several but not all members doesn't count
+        created_by   INTEGER NOT NULL,                     -- Discord user ID
+        created_at   TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE TABLE throwing_group_members (
+        group_id    INTEGER NOT NULL REFERENCES throwing_groups(id) ON DELETE CASCADE,
+        discord_id  INTEGER NOT NULL,
+        PRIMARY KEY (group_id, discord_id)
+    );
+    CREATE INDEX throwing_group_members_by_user ON throwing_group_members(discord_id);
+    -- Which groups each session involves: one row per session and group that had at least one member
+    -- in it during the group's life. It's a view, so it can't fall out of step when a session, a
+    -- group's members, its dates, or its settings are edited. `counts` applies the group's settings:
+    -- a session with every member always counts, one member counts if count_solo, and several but
+    -- not all count unless require_all.
+    CREATE VIEW session_groups AS
+    SELECT x.session_id, x.group_id, x.minutes, x.occurred_at, x.members_present, x.group_size,
+           CASE
+               WHEN x.members_present = x.group_size THEN 1
+               WHEN x.members_present = 1 THEN x.count_solo
+               ELSE NOT x.require_all
+           END AS counts
+    FROM (
+        SELECT s.id AS session_id, g.id AS group_id, s.minutes, s.occurred_at, g.count_solo, g.require_all,
+               COUNT(*) AS members_present,
+               (SELECT COUNT(*) FROM throwing_group_members WHERE group_id = g.id) AS group_size
+        FROM throwing_sessions s
+        JOIN session_participants p ON p.session_id = s.id
+        JOIN throwing_group_members m ON m.discord_id = p.discord_id
+        JOIN throwing_groups g ON g.id = m.group_id AND s.occurred_at >= g.starts_at AND s.occurred_at < g.ends_at
+        GROUP BY s.id, g.id
+    ) x;
+    """,
 ]
 
 
@@ -98,9 +138,9 @@ class Database:
         await self._migrate()
 
     async def schema(self) -> str:
-        """The CREATE TABLE statements, as SQLite stores them."""
+        """The CREATE TABLE and CREATE VIEW statements, as SQLite stores them."""
         async with self.conn.execute(
-            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
+            "SELECT sql FROM sqlite_master WHERE type IN ('table', 'view') AND name NOT LIKE 'sqlite_%' ORDER BY type, name"
         ) as cur:
             return "\n\n".join(row["sql"].strip() + ";" for row in await cur.fetchall())
 
@@ -344,3 +384,105 @@ class Database:
         for row in rows:
             row["participants"] = [int(i) for i in row["participants"].split(",")]
         return rows
+
+    # ---- throwing groups ----
+
+    async def create_groups(
+        self,
+        groups: list[tuple[str, list[int]]],
+        *,
+        starts_at: datetime,
+        ends_at: datetime,
+        count_solo: bool,
+        require_all: bool,
+        created_by: int,
+        end_others: bool,
+    ) -> list[int]:
+        """Create (name, member IDs) groups in one transaction, optionally ending every group that's
+        still running or yet to start. Returns the new group IDs."""
+        try:
+            if end_others:
+                now = _utc(datetime.now(timezone.utc))
+                await self.conn.execute("UPDATE throwing_groups SET ends_at = ? WHERE ends_at > ?", (now, now))
+            ids = []
+            for name, members in groups:
+                cur = await self.conn.execute(
+                    "INSERT INTO throwing_groups (name, starts_at, ends_at, count_solo, require_all, created_by) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (name, _utc(starts_at), _utc(ends_at), int(count_solo), int(require_all), created_by),
+                )
+                ids.append(cur.lastrowid)
+                await self.conn.executemany(
+                    "INSERT INTO throwing_group_members (group_id, discord_id) VALUES (?, ?)",
+                    [(cur.lastrowid, m) for m in members],
+                )
+            await self.conn.commit()
+        except Exception:
+            await self.conn.rollback()
+            raise
+        return ids
+
+    async def list_groups(self, *, include_ended: bool = False, group_id: int | None = None) -> list[dict]:
+        """Groups with their member IDs and the minutes and sessions that count for them, newest
+        first. Without include_ended, only groups that haven't ended yet."""
+        where, params = "1", []
+        if group_id is not None:
+            where, params = "g.id = ?", [group_id]
+        elif not include_ended:
+            where, params = "g.ends_at > ?", [_utc(datetime.now(timezone.utc))]
+        async with self.conn.execute(
+            "SELECT g.id, g.name, g.starts_at, g.ends_at, g.count_solo, g.require_all, g.created_by, "
+            "(SELECT group_concat(discord_id) FROM throwing_group_members WHERE group_id = g.id) AS members, "
+            "(SELECT COALESCE(SUM(minutes), 0) FROM session_groups WHERE group_id = g.id AND counts) AS minutes, "
+            "(SELECT COUNT(*) FROM session_groups WHERE group_id = g.id AND counts) AS sessions "
+            f"FROM throwing_groups g WHERE {where} ORDER BY g.starts_at DESC, g.id",
+            params,
+        ) as cur:
+            rows = [dict(row) for row in await cur.fetchall()]
+        for row in rows:
+            row["members"] = [int(i) for i in row["members"].split(",")] if row["members"] else []
+            row["count_solo"], row["require_all"] = bool(row["count_solo"]), bool(row["require_all"])
+        return rows
+
+    async def get_group(self, group_id: int) -> dict | None:
+        rows = await self.list_groups(group_id=group_id)
+        return rows[0] if rows else None
+
+    async def update_group(
+        self, group_id: int, *, name: str, starts_at: datetime, ends_at: datetime, count_solo: bool, require_all: bool
+    ) -> bool:
+        cur = await self.conn.execute(
+            "UPDATE throwing_groups SET name = ?, starts_at = ?, ends_at = ?, count_solo = ?, require_all = ? WHERE id = ?",
+            (name, _utc(starts_at), _utc(ends_at), int(count_solo), int(require_all), group_id),
+        )
+        await self.conn.commit()
+        return cur.rowcount > 0
+
+    async def end_group(self, group_id: int) -> bool:
+        """End a group now. False if it doesn't exist or has already ended."""
+        now = _utc(datetime.now(timezone.utc))
+        cur = await self.conn.execute(
+            "UPDATE throwing_groups SET ends_at = ? WHERE id = ? AND ends_at > ?", (now, group_id, now)
+        )
+        await self.conn.commit()
+        return cur.rowcount > 0
+
+    async def add_group_member(self, group_id: int, discord_id: int) -> bool:
+        """False if they were already in it."""
+        cur = await self.conn.execute(
+            "INSERT OR IGNORE INTO throwing_group_members (group_id, discord_id) VALUES (?, ?)", (group_id, discord_id)
+        )
+        await self.conn.commit()
+        return cur.rowcount > 0
+
+    async def remove_group_member(self, group_id: int, discord_id: int) -> bool:
+        cur = await self.conn.execute(
+            "DELETE FROM throwing_group_members WHERE group_id = ? AND discord_id = ?", (group_id, discord_id)
+        )
+        await self.conn.commit()
+        return cur.rowcount > 0
+
+    async def delete_group(self, group_id: int) -> bool:
+        cur = await self.conn.execute("DELETE FROM throwing_groups WHERE id = ?", (group_id,))
+        await self.conn.commit()
+        return cur.rowcount > 0
