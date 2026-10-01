@@ -18,6 +18,24 @@ docker compose logs -f
 
 Update after changing code: `docker compose up -d --build`. The code is copied into the image when it's built, so a plain restart keeps running the old code. After changing only `.env`, `docker compose up -d` is enough.
 
+## Automatic deploys
+
+Every push to `main` runs `.github/workflows/deploy.yml`, which SSHes into the VPS, runs `git pull --ff-only` in the repo checkout, then `docker compose up -d --build`. It can also be run by hand from the **Actions** tab.
+
+One-time setup:
+
+1. On the VPS, clone the repo and create `.env` there. The checkout must be able to `git pull` without a prompt (a public repo, or a deploy key).
+2. Create a key pair for deploys (`ssh-keygen -t ed25519 -f deploy_key -N ""`) and add `deploy_key.pub` to `~/.ssh/authorized_keys` for the VPS user. That user must be able to run `docker` without `sudo`.
+3. Under **Settings → Secrets and variables → Actions**, add these repository secrets:
+
+| Secret | Value |
+| --- | --- |
+| `VPS_HOST` | VPS hostname or IP |
+| `VPS_USER` | SSH user |
+| `VPS_SSH_KEY` | Contents of the private `deploy_key` file |
+| `VPS_PATH` | Absolute path of the repo checkout on the VPS |
+| `VPS_PORT` | Optional. SSH port, defaults to 22 |
+
 ## Local dev (Python 3.10+)
 
 ```sh
