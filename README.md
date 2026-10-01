@@ -188,4 +188,4 @@ The bot needs **View Channel** and **Send Messages** there. Keep the channel adm
 
 ## Adding a command
 
-Drop a new file in `bot/cogs/` with a `Cog` class and an `async def setup(bot)` function (see `ping.py`). Every module in that folder is loaded automatically, and slash commands sync on startup.
+Drop a new file in `bot/cogs/` with a `Cog` class and an `async def setup(bot)` function (see `groups.py` for a small one). Every module in that folder is loaded automatically, and slash commands sync on startup.
