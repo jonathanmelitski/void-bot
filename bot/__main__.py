@@ -27,11 +27,13 @@ class VoidBot(commands.Bot):
 
     async def setup_hook(self):
         # First, so errors from the rest of startup are queued and posted once the bot is connected.
+        error_channel.install(self)
         if config.ERRORS_CHANNEL_ID:
-            error_channel.install(self)
             log.info("Posting errors to channel %s", config.ERRORS_CHANNEL_ID)
         else:
             log.info("Not posting errors to Discord: ERRORS_CHANNEL_ID not set")
+        if config.LOGS_CHANNEL_ID:
+            log.info("Posting the console log to channel %s", config.LOGS_CHANNEL_ID)
 
         await self.db.connect()
         log.info("Opened database at %s", config.DB_PATH)

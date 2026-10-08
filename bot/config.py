@@ -28,6 +28,8 @@ THROWING_CHANNEL_ID = int(os.environ["THROWING_CHANNEL_ID"]) if os.getenv("THROW
 ANTHROPIC_API_KEY_SET = bool(os.getenv("ANTHROPIC_API_KEY"))
 # Optional: channel that everything logged at ERROR or above is also posted to.
 ERRORS_CHANNEL_ID = int(os.environ["ERRORS_CHANNEL_ID"]) if os.getenv("ERRORS_CHANNEL_ID") else None
+# Optional: channel that every line logged to the console is also posted to.
+LOGS_CHANNEL_ID = int(os.environ["LOGS_CHANNEL_ID"]) if os.getenv("LOGS_CHANNEL_ID") else None
 # Superadmin requests: people with this role can @mention the bot in this channel to change the
 # database in plain English (cogs/superadmin.py). Disabled unless both are set.
 SUPERADMIN_ROLE_ID = int(os.environ["SUPERADMIN_ROLE_ID"]) if os.getenv("SUPERADMIN_ROLE_ID") else None

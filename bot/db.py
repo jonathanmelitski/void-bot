@@ -1,3 +1,4 @@
+import json
 import sqlite3
 import uuid
 from dataclasses import dataclass, fields
@@ -111,6 +112,34 @@ MIGRATIONS = [
         discord_id  INTEGER NOT NULL,
         expires_at  TEXT NOT NULL,                         -- ISO 8601, UTC
         PRIMARY KEY (channel_id, discord_id)
+    );
+    """,
+    """
+    -- A minutes goal that repeats: cycle 0 starts on first_day, and each cycle is cycle_days long.
+    -- Nothing is stored per cycle; a person's progress is their session minutes inside the cycle.
+    CREATE TABLE throwing_goals (
+        id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+        name                TEXT NOT NULL,
+        minutes             INTEGER NOT NULL CHECK (minutes > 0),   -- per person, per cycle
+        first_day           TEXT NOT NULL,                 -- YYYY-MM-DD in the bot's time zone
+        cycle_days          INTEGER NOT NULL CHECK (cycle_days > 0),
+        channel_id          INTEGER NOT NULL,              -- where reminders and new groups are posted
+        remind_days_before  TEXT NOT NULL DEFAULT '',      -- comma-separated; 0 is the cycle's last day. Empty: no reminders
+        remind_hour         INTEGER NOT NULL DEFAULT 18,   -- 0-23, in the bot's time zone
+        last_reminder_at    TEXT,                          -- ISO 8601, UTC; reminder times up to here are done
+        group_config        TEXT,                          -- JSON GroupConfig; NULL: don't make groups each cycle
+        groups_cycle        INTEGER NOT NULL DEFAULT -1,   -- the last cycle groups were made for
+        created_by          INTEGER NOT NULL,              -- Discord user ID
+        created_at          TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+    -- Who a goal applies to: roles and people, looked up afresh each time, so someone given a role
+    -- later is included from then on. Anyone matched by an excluded row is left out.
+    CREATE TABLE throwing_goal_targets (
+        goal_id    INTEGER NOT NULL REFERENCES throwing_goals(id) ON DELETE CASCADE,
+        target_id  INTEGER NOT NULL,                       -- Discord role or user ID
+        is_role    INTEGER NOT NULL,
+        excluded   INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (goal_id, target_id)
     );
     """,
 ]
@@ -513,10 +542,15 @@ class Database:
         require_all: bool,
         created_by: int,
         end_others: bool,
+        goal_cycle: tuple[int, int] | None = None,
     ) -> list[int]:
         """Create (name, member IDs) groups in one transaction, optionally ending every group that's
-        still running or yet to start. Returns the new group IDs."""
+        still running or yet to start. Returns the new group IDs. goal_cycle is (goal ID, cycle) when
+        a goal is making its groups for a cycle; it's recorded in the same transaction, so a cycle
+        can't get two sets."""
         try:
+            if goal_cycle:
+                await self.conn.execute("UPDATE throwing_goals SET groups_cycle = ? WHERE id = ?", goal_cycle[::-1])
             if end_others:
                 now = _utc(datetime.now(timezone.utc))
                 await self.conn.execute("UPDATE throwing_groups SET ends_at = ? WHERE ends_at > ?", (now, now))
@@ -537,6 +571,75 @@ class Database:
             await self.conn.rollback()
             raise
         return ids
+
+    # ---- throwing goals ----
+
+    async def create_goal(
+        self,
+        *,
+        name: str,
+        minutes: int,
+        first_day: str,
+        cycle_days: int,
+        channel_id: int,
+        remind_days_before: list[int],
+        remind_hour: int,
+        group_config: dict | None,
+        targets: list[dict],
+        created_by: int,
+    ) -> int:
+        """targets are {target_id, is_role, excluded}. Reminder times before now count as done, so a
+        goal made late in a cycle doesn't send that cycle's earlier reminders at once."""
+        try:
+            cur = await self.conn.execute(
+                "INSERT INTO throwing_goals (name, minutes, first_day, cycle_days, channel_id, remind_days_before, "
+                "remind_hour, last_reminder_at, group_config, created_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    name, minutes, first_day, cycle_days, channel_id, ",".join(map(str, remind_days_before)),
+                    remind_hour, _utc(datetime.now(timezone.utc)), group_config and json.dumps(group_config), created_by,
+                ),
+            )
+            await self.conn.executemany(
+                "INSERT OR REPLACE INTO throwing_goal_targets (goal_id, target_id, is_role, excluded) VALUES (?, ?, ?, ?)",
+                [(cur.lastrowid, t["target_id"], int(t["is_role"]), int(t["excluded"])) for t in targets],
+            )
+            await self.conn.commit()
+        except Exception:
+            await self.conn.rollback()
+            raise
+        return cur.lastrowid
+
+    async def list_goals(self, goal_id: int | None = None) -> list[dict]:
+        where, params = ("id = ?", [goal_id]) if goal_id is not None else ("1", [])
+        async with self.conn.execute(f"SELECT * FROM throwing_goals WHERE {where} ORDER BY id", params) as cur:
+            goals = [dict(row) for row in await cur.fetchall()]
+        for goal in goals:
+            goal["remind_days_before"] = [int(d) for d in goal["remind_days_before"].split(",") if d]
+            goal["group_config"] = json.loads(goal["group_config"]) if goal["group_config"] else None
+            async with self.conn.execute(
+                "SELECT target_id, is_role, excluded FROM throwing_goal_targets WHERE goal_id = ? ORDER BY excluded, is_role DESC",
+                (goal["id"],),
+            ) as cur:
+                goal["targets"] = [dict(row) for row in await cur.fetchall()]
+        return goals
+
+    async def get_goal(self, goal_id: int) -> dict | None:
+        goals = await self.list_goals(goal_id)
+        return goals[0] if goals else None
+
+    async def mark_goal_reminded(self, goal_id: int, at: datetime):
+        await self.conn.execute("UPDATE throwing_goals SET last_reminder_at = ? WHERE id = ?", (_utc(at), goal_id))
+        await self.conn.commit()
+
+    async def mark_goal_groups(self, goal_id: int, cycle: int):
+        """Groups for this cycle are dealt with (used when there was nobody to make groups from)."""
+        await self.conn.execute("UPDATE throwing_goals SET groups_cycle = ? WHERE id = ?", (cycle, goal_id))
+        await self.conn.commit()
+
+    async def delete_goal(self, goal_id: int) -> bool:
+        cur = await self.conn.execute("DELETE FROM throwing_goals WHERE id = ?", (goal_id,))
+        await self.conn.commit()
+        return cur.rowcount > 0
 
     async def list_groups(self, *, include_ended: bool = False, group_id: int | None = None) -> list[dict]:
         """Groups with their member IDs and the minutes and sessions that count for them, newest

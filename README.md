@@ -181,6 +181,42 @@ The `group` option autocompletes as you type an ID, a group name or a member's n
 
 Nothing is stored when a session is logged. The `session_groups` view works this out from the sessions, the groups and their settings each time it's read (`session_id`, `group_id`, `members_present`, `group_size`, and `counts`), so editing a group, its members or a session can never leave it out of date. `/throwing query` and superadmin requests can both see groups. Tables: `throwing_groups` and `throwing_group_members`.
 
+### Throwing goals
+
+A goal is a number of minutes each person in a pool should throw every cycle, repeating until it's deleted. `/throwing-mgr goal` manages them, with the same permissions as the rest of `/throwing-mgr`.
+
+`/throwing-mgr goal create` takes these options, then opens a form:
+
+| Option | What it is |
+| --- | --- |
+| `name` | What to call it |
+| `minutes` | Minutes each person should throw per cycle |
+| `channel` | Where reminders, and new groups, are posted |
+| `make_groups` | Make new random throwing groups from the goal's people at the start of every cycle |
+| `cycle_days` | How long a cycle is. Default 7 |
+| `first_day` | First day of the first cycle. Default: Monday of this week |
+| `remind_days_before` | Days before a cycle's last day to remind on, such as `2, 0` (0 is the last day). Blank means no reminders |
+| `remind_hour` | Hour the reminders go out, 0-23 in `TIMEZONE`. Default 18 |
+
+The form asks for the **Pool** and **Exclude** (roles and/or people, as in `creategroups`) and, with `make_groups`, the **Group size** and **Group settings**. Those are the same fields `creategroups` uses.
+
+| Command | What it does |
+| --- | --- |
+| `/throwing-mgr goal list` | The goals, with their current cycle, pool, reminders and group settings |
+| `/throwing-mgr goal progress goal` | Everyone's minutes this cycle, and who has reached it |
+| `/throwing-mgr goal remind goal` | Send the reminder now |
+| `/throwing-mgr goal delete goal` | Delete it. Sessions and the groups it made aren't touched |
+
+How it works:
+
+- **Progress** is a person's total minutes from every session they took part in during the cycle, alone or with anyone. Group rules don't come into it. Nothing is stored per cycle.
+- **The pool is looked up each time**, so someone given a pool role later is included from then on, and someone who loses it or leaves drops out.
+- **Reminders** ping, in the goal's channel, everyone who is short, with their minutes so far. If everyone has reached it, nothing is posted. A goal made part-way through a cycle doesn't send that cycle's earlier reminders. If the bot was down at a reminder time, it's sent when the bot comes back if that's within 3 hours, and skipped otherwise.
+- **Groups** made for a cycle live for exactly that cycle, are posted silently in the goal's channel, and show up in `/throwing-mgr list` like any others. A goal created part-way through a cycle makes that cycle's groups straight away.
+- The bot checks goals once a minute. It needs **View Channel** and **Send Messages** in the goal's channel.
+
+A goal can't be edited: delete it and make it again. Tables: `throwing_goals` and `throwing_goal_targets`; a goal's group settings are stored as JSON in `throwing_goals.group_config`.
+
 ## Superadmin requests
 
 Set `SUPERADMIN_ROLE_ID` and `SUPERADMIN_MANAGEMENT_CHANNEL_ID` in `.env` (and `ANTHROPIC_API_KEY`). Someone with that role can then @mention the bot in that channel and ask for a change to the database in plain English, such as purging players who have left the server, or changing a session's minutes and removing someone from it. Server administrators without the role can't use it.
@@ -207,6 +243,14 @@ The bot needs **View Channel**, **Send Messages** and **Read Message History** i
 Set `ERRORS_CHANNEL_ID` in `.env` and the bot posts everything it logs at error level to that channel, from any part of the bot: failed throwing scans, Claude API failures, slash-command crashes and uncaught exceptions, with the traceback. Warnings and info lines stay in `docker compose logs` only, and so does anything that goes wrong before the bot connects (a bad token, a missing variable) or while Discord is unreachable. During a burst of errors it posts about one a second and drops anything past 50 waiting.
 
 The bot needs **View Channel** and **Send Messages** there. Keep the channel admin-only, since tracebacks can include IDs and other details.
+
+## Log channel
+
+Set `LOGS_CHANNEL_ID` in `.env` and the bot posts every line it logs to that channel, in the same format as `docker compose logs`: info, warnings and errors, from the bot and from discord.py. Lines are batched into one message about every second. Errors still go to the error channel as well, if that's set.
+
+It only carries what goes through Python's logging once the bot is connected. Startup lines logged before then are held and posted on connect, but anything printed straight to the console (a crash before logging starts, a missing variable, a failure to post to these channels) stays in `docker compose logs` only. If the bot logs faster than it can post, it keeps up to 1000 lines waiting, drops the rest, and says how many it dropped.
+
+The bot needs **View Channel** and **Send Messages** there. Keep the channel private to the people who run the bot: the log includes members' names and IDs, `/throwing query` questions, name lookups, and superadmin requests with their SQL, which can contain emails, phone numbers and Penn IDs.
 
 ## Adding a command
 
