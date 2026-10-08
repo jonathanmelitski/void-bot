@@ -41,19 +41,22 @@ def parse_id(value) -> int:
     return int(value)
 
 
-async def _names_on_file(db) -> dict[int, str]:
-    return {
-        p.discord_id: name
-        for p in await db.list_players()
-        if (name := " ".join(filter(None, [p.first_name, p.last_name])))
-    }
+async def _players_on_file(db) -> dict:
+    return {p.discord_id: p for p in await db.list_players()}
+
+
+def _name_on_file(player) -> str | None:
+    """First Last "Nickname", with whichever parts are on file."""
+    if not player:
+        return None
+    return " ".join(filter(None, [player.full_name, player.nickname and f'"{player.nickname}"'])) or None
 
 
 async def display_names(guild: discord.Guild, db) -> dict[int, str]:
-    """Discord ID -> "Display (First Last)" for every human member."""
-    on_file = await _names_on_file(db)
+    """Discord ID -> 'Display (First Last "Nickname")' for every human member."""
+    on_file = await _players_on_file(db)
     return {
-        m.id: f"{m.display_name} ({on_file[m.id]})" if m.id in on_file else m.display_name
+        m.id: f"{m.display_name} ({name})" if (name := _name_on_file(on_file.get(m.id))) else m.display_name
         for m in guild.members
         if not m.bot
     }
@@ -65,8 +68,9 @@ def find_members_tool(guild: discord.Guild, db):
     @beta_async_tool
     @logged_tool
     async def find_members(name: str) -> str:
-        """Look up server members by name. Matches display names, nicknames, usernames, and the
-        first/last names on file in the player database. Use it to turn every name into a Discord ID.
+        """Look up server members by name. Matches display names, server nicknames, usernames, and
+        the first/last names and nicknames on file in the player database. Use it to turn every name
+        into a Discord ID.
 
         Args:
             name: A first name, last name, full name, nickname, or username, or part of one.
@@ -74,19 +78,24 @@ def find_members_tool(guild: discord.Guild, db):
         needle = name.strip().lstrip("@").lower()
         if not needle:
             raise ToolError("name is empty.")
-        on_file = await _names_on_file(db)
+        on_file = await _players_on_file(db)
         matches = []
         for m in guild.members:
             if m.bot:
                 continue
-            fields = [m.display_name, m.name, m.global_name, getattr(m, "nick", None), on_file.get(m.id)]
+            player = on_file.get(m.id)
+            fields = [
+                m.display_name, m.name, m.global_name, getattr(m, "nick", None),
+                player and player.full_name, player and player.nickname,
+            ]
             if needle in " ".join(filter(None, fields)).lower():
                 matches.append(
                     {
                         "id": str(m.id),
                         "display_name": m.display_name,
                         "username": m.name,
-                        "name_on_file": on_file.get(m.id),
+                        "name_on_file": player and player.full_name,
+                        "nickname_on_file": player and player.nickname,
                     }
                 )
         return json.dumps({"matches": matches[:15], "total_matches": len(matches)})

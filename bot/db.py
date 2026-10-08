@@ -84,6 +84,35 @@ MIGRATIONS = [
         GROUP BY s.id, g.id
     ) x;
     """,
+    """
+    ALTER TABLE players ADD COLUMN nickname TEXT;          -- what teammates call them; several separated by commas
+    -- Reports that were added to a session someone else had already logged. The report that created
+    -- a session is throwing_sessions.source_message_id; these are the later ones.
+    CREATE TABLE session_reports (
+        message_id  INTEGER PRIMARY KEY,
+        session_id  TEXT NOT NULL REFERENCES throwing_sessions(id) ON DELETE CASCADE,
+        created_at  TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+    """,
+    """
+    -- Every channel /group create has made. /group commands only ever act on channels listed here.
+    -- Who is in a group isn't stored: it's whoever the channel's permissions let in.
+    CREATE TABLE group_channels (
+        channel_id   INTEGER PRIMARY KEY,
+        name         TEXT NOT NULL,                        -- as created, before any archived- prefix
+        created_by   INTEGER NOT NULL,                     -- Discord user ID
+        created_at   TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        archived_at  TEXT                                  -- ISO 8601, UTC; NULL while active
+    );
+    -- People let into a group for a short while (/group join). Stored so they're still removed on
+    -- time if the bot restarts in between.
+    CREATE TABLE group_visits (
+        channel_id  INTEGER NOT NULL REFERENCES group_channels(channel_id) ON DELETE CASCADE,
+        discord_id  INTEGER NOT NULL,
+        expires_at  TEXT NOT NULL,                         -- ISO 8601, UTC
+        PRIMARY KEY (channel_id, discord_id)
+    );
+    """,
 ]
 
 
@@ -96,14 +125,20 @@ class Player:
     email: str | None = None
     penn_id: str | None = None
     phone: str | None = None
+    nickname: str | None = None
 
     @property
     def is_complete(self) -> bool:
-        return all(getattr(self, c) for c in EDITABLE_COLUMNS)
+        return all(getattr(self, c) for c in EDITABLE_COLUMNS - OPTIONAL_COLUMNS)
+
+    @property
+    def full_name(self) -> str | None:
+        return " ".join(filter(None, [self.first_name, self.last_name])) or None
 
 
 PLAYER_COLUMNS = [f.name for f in fields(Player)]
 EDITABLE_COLUMNS = set(PLAYER_COLUMNS) - {"discord_id"}
+OPTIONAL_COLUMNS = {"nickname"}  # most players don't have one
 
 
 def _utc(dt: datetime) -> str:
@@ -275,23 +310,17 @@ class Database:
         await self.conn.commit()
         return cur.rowcount > 0
 
-    async def session_for_message(self, message_id: int) -> str | None:
-        async with self.conn.execute(
-            "SELECT id FROM throwing_sessions WHERE source_message_id = ?", (message_id,)
-        ) as cur:
-            row = await cur.fetchone()
-        return row["id"] if row else None
-
-    async def logged_message_ids(self, message_ids: list[int]) -> set[int]:
-        """Which of these messages already have a session logged from them."""
+    async def sessions_for_messages(self, message_ids: list[int]) -> dict[int, str]:
+        """Report message ID -> the session it was logged as or added to, for those already handled."""
         if not message_ids:
-            return set()
+            return {}
+        marks = ", ".join("?" for _ in message_ids)
         async with self.conn.execute(
-            "SELECT source_message_id FROM throwing_sessions "
-            f"WHERE source_message_id IN ({', '.join('?' for _ in message_ids)})",
-            message_ids,
+            f"SELECT source_message_id AS message_id, id AS session_id FROM throwing_sessions WHERE source_message_id IN ({marks}) "
+            f"UNION ALL SELECT message_id, session_id FROM session_reports WHERE message_id IN ({marks})",
+            [*message_ids, *message_ids],
         ) as cur:
-            return {row["source_message_id"] for row in await cur.fetchall()}
+            return {row["message_id"]: row["session_id"] for row in await cur.fetchall()}
 
     async def report_threads(self, message_ids: list[int]) -> dict[int, int]:
         """Report message ID -> the thread asking about it, for those that have one."""
@@ -349,6 +378,26 @@ class Database:
             raise
         return session_id
 
+    async def join_session(self, session_id: str, participant_ids: list[int], message_id: int) -> bool:
+        """Add people to a session that's already logged, and record the report that added them so
+        it isn't read again. False if the session no longer exists."""
+        try:
+            async with self.conn.execute("SELECT 1 FROM throwing_sessions WHERE id = ?", (session_id,)) as cur:
+                if not await cur.fetchone():
+                    return False
+            await self.conn.executemany(
+                "INSERT OR IGNORE INTO session_participants (session_id, discord_id) VALUES (?, ?)",
+                [(session_id, d) for d in participant_ids],
+            )
+            await self.conn.execute(
+                "INSERT OR REPLACE INTO session_reports (message_id, session_id) VALUES (?, ?)", (message_id, session_id)
+            )
+            await self.conn.commit()
+        except Exception:
+            await self.conn.rollback()
+            raise
+        return True
+
     async def throwing_totals(
         self, start: datetime, end: datetime, discord_ids: list[int] | None = None, limit: int = 25
     ) -> list[dict]:
@@ -384,6 +433,73 @@ class Database:
         for row in rows:
             row["participants"] = [int(i) for i in row["participants"].split(",")]
         return rows
+
+    # ---- group channels ----
+
+    async def add_group_channel(self, channel_id: int, name: str, created_by: int):
+        await self.conn.execute(
+            "INSERT OR IGNORE INTO group_channels (channel_id, name, created_by) VALUES (?, ?, ?)",
+            (channel_id, name, created_by),
+        )
+        await self.conn.commit()
+
+    async def list_group_channels(self, *, include_archived: bool = False) -> list[dict]:
+        """Channels made by /group create, newest first."""
+        where = "1" if include_archived else "archived_at IS NULL"
+        async with self.conn.execute(
+            f"SELECT channel_id, name, created_by, created_at, archived_at FROM group_channels WHERE {where} "
+            "ORDER BY created_at DESC, channel_id DESC"
+        ) as cur:
+            return [dict(row) for row in await cur.fetchall()]
+
+    async def get_group_channel(self, channel_id: int) -> dict | None:
+        async with self.conn.execute(
+            "SELECT channel_id, name, created_by, created_at, archived_at FROM group_channels WHERE channel_id = ?",
+            (channel_id,),
+        ) as cur:
+            row = await cur.fetchone()
+        return dict(row) if row else None
+
+    async def archive_group_channel(self, channel_id: int):
+        """Mark a group archived and forget its visits."""
+        await self.conn.execute(
+            "UPDATE group_channels SET archived_at = ? WHERE channel_id = ?",
+            (_utc(datetime.now(timezone.utc)), channel_id),
+        )
+        await self.conn.execute("DELETE FROM group_visits WHERE channel_id = ?", (channel_id,))
+        await self.conn.commit()
+
+    async def delete_group_channel(self, channel_id: int):
+        await self.conn.execute("DELETE FROM group_channels WHERE channel_id = ?", (channel_id,))
+        await self.conn.commit()
+
+    async def add_group_visit(self, channel_id: int, discord_id: int, expires_at: datetime):
+        """Start a visit, or move the end of one that's already running."""
+        await self.conn.execute(
+            "INSERT OR REPLACE INTO group_visits (channel_id, discord_id, expires_at) VALUES (?, ?, ?)",
+            (channel_id, discord_id, _utc(expires_at)),
+        )
+        await self.conn.commit()
+
+    async def remove_group_visit(self, channel_id: int, discord_id: int) -> bool:
+        cur = await self.conn.execute(
+            "DELETE FROM group_visits WHERE channel_id = ? AND discord_id = ?", (channel_id, discord_id)
+        )
+        await self.conn.commit()
+        return cur.rowcount > 0
+
+    async def group_visits(self, *, channel_id: int | None = None, expired_only: bool = False) -> list[dict]:
+        where, params = ["1"], []
+        if channel_id is not None:
+            where.append("channel_id = ?")
+            params.append(channel_id)
+        if expired_only:
+            where.append("expires_at <= ?")
+            params.append(_utc(datetime.now(timezone.utc)))
+        async with self.conn.execute(
+            f"SELECT channel_id, discord_id, expires_at FROM group_visits WHERE {' AND '.join(where)}", params
+        ) as cur:
+            return [dict(row) for row in await cur.fetchall()]
 
     # ---- throwing groups ----
 

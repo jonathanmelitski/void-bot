@@ -16,9 +16,9 @@ log = logging.getLogger(__name__)
 
 
 def player_embed(player: Player) -> discord.Embed:
-    name = " ".join(filter(None, [player.first_name, player.last_name])) or "(no name yet)"
-    embed = discord.Embed(title=name, color=discord.Color.blurple())
+    embed = discord.Embed(title=player.full_name or "(no name yet)", color=discord.Color.blurple())
     embed.add_field(name="Discord", value=f"<@{player.discord_id}>")
+    embed.add_field(name="Nickname", value=player.nickname or MISSING)
     embed.add_field(name="Penn ID", value=player.penn_id or MISSING)
     embed.add_field(name="Email", value=player.email or MISSING, inline=False)
     embed.add_field(name="Phone", value=format_phone(player.phone) or MISSING, inline=False)
@@ -197,7 +197,7 @@ class Players(commands.GroupCog, group_name="player", group_description="Manage 
         )
 
     @app_commands.command(description="Add a single player. Details are optional and can be filled in later.")
-    @app_commands.describe(penn_id="8-digit Penn ID")
+    @app_commands.describe(penn_id="8-digit Penn ID", nickname="What teammates call them; separate several with commas")
     async def add(
         self,
         interaction: discord.Interaction,
@@ -207,6 +207,7 @@ class Players(commands.GroupCog, group_name="player", group_description="Manage 
         email: str | None = None,
         penn_id: str | None = None,
         phone: str | None = None,
+        nickname: str | None = None,
     ):
         if await self.db.get_player(member.id):
             await interaction.response.send_message(
@@ -215,7 +216,7 @@ class Players(commands.GroupCog, group_name="player", group_description="Manage 
             return
 
         player = Player(member.id, **clean_fields(
-            first_name=first_name, last_name=last_name, email=email, penn_id=penn_id, phone=phone
+            first_name=first_name, last_name=last_name, email=email, penn_id=penn_id, phone=phone, nickname=nickname
         ))
         await self.db.add_player(player)
         await interaction.response.send_message("Player added.", embed=player_embed(player), ephemeral=True)
@@ -244,7 +245,7 @@ class Players(commands.GroupCog, group_name="player", group_description="Manage 
         lines = [
             " · ".join(
                 [
-                    f"**{p.last_name or MISSING}, {p.first_name or MISSING}**",
+                    f"**{p.last_name or MISSING}, {p.first_name or MISSING}**" + (f' "{p.nickname}"' if p.nickname else ""),
                     f"<@{p.discord_id}>",
                     p.penn_id or MISSING,
                     p.email or MISSING,
@@ -338,6 +339,22 @@ class Players(commands.GroupCog, group_name="player", group_description="Manage 
             return
         values = {field: getattr(player, field) for field in FIELD_INPUTS}
         await interaction.response.send_modal(EditPlayerModal(self.db, member.id, member.display_name, values))
+
+    # Its own command because the edit form is full: a Discord form holds five fields at most.
+    @app_commands.command(description="Set or clear a player's nickname, so throwing reports can use it.")
+    @app_commands.describe(nickname="What teammates call them; separate several with commas. Leave out to clear it.")
+    async def nickname(
+        self, interaction: discord.Interaction, member: discord.User, nickname: app_commands.Range[str, 1, 100] | None = None
+    ):
+        if not await self.db.get_player(member.id):
+            await interaction.response.send_message(
+                f"{member.mention} isn't in the database. Add them with `/player add` first.", ephemeral=True
+            )
+            return
+        player = await self.db.update_player(member.id, nickname=clean_field("nickname", nickname) if nickname else None)
+        await interaction.response.send_message(
+            "Nickname saved." if nickname else "Nickname cleared.", embed=player_embed(player), ephemeral=True
+        )
 
     @app_commands.command(description="Remove a player from the database.")
     async def remove(self, interaction: discord.Interaction, member: discord.User):

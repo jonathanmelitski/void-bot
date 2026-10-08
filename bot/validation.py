@@ -49,6 +49,7 @@ CLEANERS = {
     "email": clean_email,
     "penn_id": clean_penn_id,
     "phone": clean_phone,
+    "nickname": lambda v: clean_name(v, "Nickname"),
 }
 
 

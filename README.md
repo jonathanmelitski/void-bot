@@ -62,6 +62,7 @@ To also hide the commands from everyone else, go to **Server Settings → Integr
 | `/player get` | Show one player's info |
 | `/player list [incomplete_only]` | List players, or only those with missing details |
 | `/player update member` | Opens a form with the player's current details. Edit the boxes and submit; emptying a box clears that field. |
+| `/player nickname member [nickname]` | Set what teammates call someone, so throwing reports can use it. Separate several with commas. Leave `nickname` out to clear it. |
 | `/player remove` | Delete a player's record |
 | `/player clear` | Delete every player, after typing `DELETE` in a confirmation popup. The reply includes a CSV backup. |
 
@@ -91,7 +92,22 @@ docker compose cp bot:/app/data/backup.db ./players-backup.db
 
 `/group create` opens a popup where you name the group and pick up to 25 members. The bot creates a private text channel with that name that only you, the people you picked and the bot can see, then posts a welcome message mentioning everyone. Tick **Include names and phone numbers** to list each member's name and phone number from the player database next to their @. The bot tells you privately who has nothing on file. Like `/player`, only server admins and `ADMIN_ROLE_IDS` roles can use it.
 
-The bot's role needs the **Manage Channels** permission for this. Set `GROUP_CATEGORY_ID` in `.env` to put group channels under a category.
+The bot keeps a list of every channel `/group create` makes (the `group_channels` table), and the commands below only work on channels in that list, so they can't touch a channel the bot didn't create. Who is in a group isn't stored: it's the people named in the channel's permissions.
+
+| Command | What it does |
+| --- | --- |
+| `/group list [include_archived]` | The bot's groups, with their members and anyone visiting |
+| `/group add group member` | Add someone. The bot says so in the channel, since Discord doesn't tell people when they're let in. |
+| `/group remove group member` | Remove someone |
+| `/group join group [minutes]` | Let yourself in for 5 minutes (or up to 60), for example to post a message. The bot takes you out when the time is up, even if it was restarted in between. Running it again moves the end time. |
+| `/group archive group` | Rename the channel to `archived-<name>`, move it to the archive category, and stop new messages. Members can still read it. |
+| `/group adopt channel` | Put a channel the bot made before it kept a list into the list. Only works if the channel still has the "Group created by" topic the bot gave it. |
+
+The `group` option autocompletes from the bot's list as you type, so you can pick a group you can't see. Archived groups can't be changed or joined.
+
+Archived channels go to `GROUP_ARCHIVE_CATEGORY_ID` if it's set. Otherwise the bot creates a private **Archived groups** category. A Discord category holds 50 channels, so when one is full the bot makes **Archived groups 2**, and so on.
+
+The bot's role needs **Manage Channels** and **Manage Roles** for these (Discord requires the second to change who can see a channel). Set `GROUP_CATEGORY_ID` in `.env` to put group channels under a category.
 
 ## Throwing sessions
 
@@ -104,15 +120,21 @@ When it's tagged:
 3. **Incomplete reports:** if the minutes are missing, or a name is ambiguous (it matches two people) or unknown, the bot starts a thread on the report and asks there, mentioning the reporter silently. A report that already has a thread doesn't get a second one.
 4. **Answers:** the bot reads messages posted in those threads, without needing a tag. Once the report is complete it's logged and the thread is deleted. It asks at most 3 questions per report. Saying "cancel" drops it; that thread archives itself after an hour.
 
+**Solo throwing.** A report that names nobody else ("threw 45") is a solo session for the reporter. The bot doesn't ask who they threw with.
+
+**People the bot can't place.** It only knows people in the server, so a name can belong to someone it will never find. It asks who they mean, at most twice. If the reporter says the person isn't in the server, or two questions don't settle it, the session is logged without that person: solo, if nobody else was named.
+
+**The same session reported twice.** Before logging a complete report, the bot looks for a session logged within 12 hours of it that either includes someone the reporter says they threw with, or that somebody else logged the reporter in. If there is one, it asks in a thread whether this is the same session. On yes, the report's people are added to that session, which keeps its original minutes and time, and nothing new is logged. On no, it's logged as its own session. Replying "I was there too" to a report that's already logged adds you to it without a question. Your own earlier sessions never trigger the question, so throwing twice in a day is fine. A report isn't logged until the question is answered.
+
 A report nobody tags the bot about within an hour isn't picked up. If something goes wrong, the bot reacts ⚠️ on the message that triggered it and logs the error.
 
-The reporter is counted as a participant unless they say otherwise. Claude looks names up with a `find_members` tool that matches display names, nicknames, usernames and the names in the player database; it can't see emails, phone numbers or Penn IDs. `CLAUDE_MODEL` changes the model.
+The reporter is counted as a participant unless they say otherwise. Claude looks names up with a `find_members` tool that matches display names, server nicknames, usernames, and the names and nicknames in the player database (`/player nickname`); it can't see emails, phone numbers or Penn IDs. `CLAUDE_MODEL` changes the model.
 
 The bot's role needs these permissions in the channel: **View Channel**, **Read Message History**, **Add Reactions**, **Create Public Threads**, **Send Messages in Threads** and **Manage Threads** (to delete a thread once its report is logged; without it the thread is left to archive).
 
 The emoji come from `scripts/make_emotes.py`, which draws a flying disc with the minutes next to it for 5 to 180 minutes: `pipenv run pip install pillow`, `pipenv run python scripts/make_emotes.py`, then upload the PNGs in `emotes/` either to the bot's application (Developer Portal → your app → **Emojis**) or to the server (**Server Settings → Emoji**). Discord names each emoji after its file. The bot looks in the server first, then the application, and reads the application's list once at first use, so restart it after uploading more. It works without them.
 
-Tables: `throwing_sessions` (UUID `id`, `occurred_at`, `minutes`, `description`, `reported_by`, `source_message_id`) and `session_participants` (`session_id`, `discord_id`). `report_threads` maps a report's message ID to the open question thread about it, and holds IDs only.
+Tables: `throwing_sessions` (UUID `id`, `occurred_at`, `minutes`, `description`, `reported_by`, `source_message_id`) and `session_participants` (`session_id`, `discord_id`). `session_reports` maps a later report's message ID to the session it was added to. `report_threads` maps a report's message ID to the open question thread about it, and holds IDs only.
 
 ### Asking about throwing
 
@@ -163,7 +185,7 @@ Nothing is stored when a session is logged. The `session_groups` view works this
 
 Set `SUPERADMIN_ROLE_ID` and `SUPERADMIN_MANAGEMENT_CHANNEL_ID` in `.env` (and `ANTHROPIC_API_KEY`). Someone with that role can then @mention the bot in that channel and ask for a change to the database in plain English, such as purging players who have left the server, or changing a session's minutes and removing someone from it. Server administrators without the role can't use it.
 
-1. Claude (`SUPERADMIN_MODEL`, default `claude-opus-5-5`) looks at the database and writes the SQL. It can run any `SELECT`, on every table and column, so **emails, phone numbers and Penn IDs are sent to the Claude API** when a request touches them. It can also see who is currently in the server.
+1. Claude (`SUPERADMIN_MODEL`, default `claude-opus-5-5`) looks at the database and writes the SQL. It can run any `SELECT`, on every table and column. It can also see who is currently in the server.
 2. The bot replies with what will change, the SQL, how many rows each statement would change (from a dry run that is rolled back), and **Confirm** and **Cancel** buttons.
 3. Nothing changes until a superadmin presses Confirm. Any superadmin can press it, not only the one who asked. Each plan runs at most once: the first press removes the buttons, and they expire after 10 minutes or when the bot restarts.
 4. On Confirm the bot copies the database to `data/backups/before-superadmin-<time>.db` (the newest 10 are kept), then runs the statements in one transaction. If any statement fails, none apply.

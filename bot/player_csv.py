@@ -9,8 +9,8 @@ from dataclasses import dataclass, field
 from .db import Player
 from .validation import ValidationError, clean_field
 
-COLUMNS = ["discord_id", "discord_username", "first_name", "last_name", "email", "penn_id", "phone"]
-DETAIL_COLUMNS = ["first_name", "last_name", "email", "penn_id", "phone"]
+COLUMNS = ["discord_id", "discord_username", "first_name", "last_name", "nickname", "email", "penn_id", "phone"]
+DETAIL_COLUMNS = ["first_name", "last_name", "nickname", "email", "penn_id", "phone"]
 
 # Header spellings people are likely to use, after normalizing to snake_case.
 HEADER_ALIASES = {
@@ -23,6 +23,9 @@ HEADER_ALIASES = {
     "firstname": "first_name",
     "last": "last_name",
     "lastname": "last_name",
+    "nick": "nickname",
+    "nicknames": "nickname",
+    "goes_by": "nickname",
     "email_address": "email",
     "pennid": "penn_id",
     "phone_number": "phone",
@@ -44,7 +47,7 @@ def write_csv(players: Iterable[Player], usernames: dict[int, str]) -> bytes:
     writer.writerow(COLUMNS)
     for p in players:
         writer.writerow(
-            [p.discord_id, usernames.get(p.discord_id, ""), p.first_name, p.last_name, p.email, p.penn_id, p.phone]
+            [p.discord_id, usernames.get(p.discord_id, ""), p.first_name, p.last_name, p.nickname, p.email, p.penn_id, p.phone]
         )
     # BOM so Excel opens it as UTF-8 (names with accents etc.).
     return buf.getvalue().encode("utf-8-sig")

@@ -18,6 +18,10 @@ DB_PATH = os.getenv("DB_PATH", "data/players.db")
 ADMIN_ROLE_IDS = {int(i) for i in os.getenv("ADMIN_ROLE_IDS", "").split(",") if i.strip()}
 # Optional: category that /group channels are created in.
 GROUP_CATEGORY_ID = int(os.environ["GROUP_CATEGORY_ID"]) if os.getenv("GROUP_CATEGORY_ID") else None
+# Optional: category that /group archive moves channels to. Without it the bot makes its own.
+GROUP_ARCHIVE_CATEGORY_ID = (
+    int(os.environ["GROUP_ARCHIVE_CATEGORY_ID"]) if os.getenv("GROUP_ARCHIVE_CATEGORY_ID") else None
+)
 # Throwing-session logging. Disabled unless both are set. The Anthropic SDK reads
 # ANTHROPIC_API_KEY from the environment itself.
 THROWING_CHANNEL_ID = int(os.environ["THROWING_CHANNEL_ID"]) if os.getenv("THROWING_CHANNEL_ID") else None
