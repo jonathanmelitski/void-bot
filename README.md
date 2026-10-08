@@ -185,37 +185,35 @@ Nothing is stored when a session is logged. The `session_groups` view works this
 
 A goal is a number of minutes each person in a pool should throw every cycle, repeating until it's deleted. `/throwing-mgr goal` manages them, with the same permissions as the rest of `/throwing-mgr`.
 
-`/throwing-mgr goal create` takes these options, then opens a form:
+`/throwing-mgr goal create` is two forms, because a Discord form holds five fields. Nothing is saved until the second one is submitted.
 
-| Option | What it is |
-| --- | --- |
-| `name` | What to call it |
-| `minutes` | Minutes each person should throw per cycle |
-| `channel` | Where reminders, and new groups, are posted |
-| `make_groups` | Make new random throwing groups from the goal's people at the start of every cycle |
-| `cycle_days` | How long a cycle is. Default 7 |
-| `first_day` | First day of the first cycle. Default: Monday of this week |
-| `remind_days_before` | Days before a cycle's last day to remind on, such as `2, 0` (0 is the last day). Blank means no reminders |
-| `remind_hour` | Hour the reminders go out, 0-23 in `TIMEZONE`. Default 18 |
-
-The form asks for the **Pool** and **Exclude** (roles and/or people, as in `creategroups`) and, with `make_groups`, the **Group size** and **Group settings**. Those are the same fields `creategroups` uses.
+1. **Who and how much:** Name, Minutes (per person, per cycle), Pool and Exclude (roles and/or people, as in `creategroups`), and the Channel that reminders and new groups are posted in.
+2. **Schedule and groups**, opened by the button the first form leaves:
+   - **First cycle starts:** a date and time, like `2026-10-04 20:00` or `10/4 8pm`. A date alone means midnight. It can be in the past.
+   - **Repeats every:** any number of hours, days, weeks or months: `1 week`, `3 days`, `12 hours`, `1 month`.
+   - **Reminders:** how long before each cycle ends to ping people who are short, like `2d, 6h` (days, hours or minutes). Blank for none.
+   - **Group size** and **Group settings:** fill in a size to have new random throwing groups made from the pool at the start of every cycle. Leave it blank for none. These are the same fields `creategroups` uses.
 
 | Command | What it does |
 | --- | --- |
 | `/throwing-mgr goal list` | The goals, with their current cycle, pool, reminders and group settings |
-| `/throwing-mgr goal progress goal` | Everyone's minutes this cycle, and who has reached it |
+| `/throwing-mgr goal progress goal [cycles_ago]` | Everyone's minutes in a cycle and who reached it. The current cycle by default; `cycles_ago: 1` is the one before |
+| `/throwing-mgr goal history goal [cycles]` | The last few cycles (8 by default): how many people reached it each time, and each person's minutes per cycle |
 | `/throwing-mgr goal remind goal` | Send the reminder now |
 | `/throwing-mgr goal delete goal` | Delete it. Sessions and the groups it made aren't touched |
 
 How it works:
 
-- **Progress** is a person's total minutes from every session they took part in during the cycle, alone or with anyone. Group rules don't come into it. Nothing is stored per cycle.
-- **The pool is looked up each time**, so someone given a pool role later is included from then on, and someone who loses it or leaves drops out.
-- **Reminders** ping, in the goal's channel, everyone who is short, with their minutes so far. If everyone has reached it, nothing is posted. A goal made part-way through a cycle doesn't send that cycle's earlier reminders. If the bot was down at a reminder time, it's sent when the bot comes back if that's within 3 hours, and skipped otherwise.
+- **Progress** is a person's total minutes from every session they took part in during the cycle, alone or with anyone. Group rules don't come into it.
+- **Goals count retroactively.** Nothing is stored per cycle: progress is always read from the logged sessions. So a goal whose first cycle starts in the past has every cycle since then, and `progress` and `history` show them. Sessions logged late ("threw yesterday") land in the cycle they happened in. Starting in the past doesn't send old reminders or make groups for cycles that are over.
+- **The pool is looked up each time**, so someone given a pool role later is included from then on, and someone who loses it or leaves drops out. Past cycles are shown for today's pool; who was in it back then isn't recorded.
+- **Reminders** ping, in the goal's channel, everyone who is short, with their minutes so far. If everyone has reached it, nothing is posted. If the bot was down at a reminder time, it's sent when the bot comes back if that's within 3 hours, and skipped otherwise.
 - **Groups** made for a cycle live for exactly that cycle, are posted silently in the goal's channel, and show up in `/throwing-mgr list` like any others. A goal created part-way through a cycle makes that cycle's groups straight away.
 - The bot checks goals once a minute. It needs **View Channel** and **Send Messages** in the goal's channel.
 
-A goal can't be edited: delete it and make it again. Tables: `throwing_goals` and `throwing_goal_targets`; a goal's group settings are stored as JSON in `throwing_goals.group_config`.
+**Daylight saving.** Times are on the clock in `TIMEZONE`. A cycle that repeats in days, weeks or months starts at the same time of day all year: one that starts Sunday at 20:00 starts every Sunday at 20:00, and the week the clocks change is an hour shorter or longer. A reminder given in days works the same way (`1d` before a 20:00 end is 20:00 the day before). Cycles and reminders given in hours or minutes are real elapsed time, so a `12 hours` cycle shifts by an hour on the clock when it changes. A start time that doesn't exist on the night the clocks go forward (02:30) happens an hour later that one night; one that happens twice when they go back (01:30) uses the first. A monthly goal that starts on the 31st uses the last day of shorter months and goes back to the 31st after.
+
+A goal can't be edited: delete it and make it again, which loses nothing, since progress comes from the sessions. Tables: `throwing_goals` and `throwing_goal_targets`; a goal's group settings are stored as JSON in `throwing_goals.group_config`.
 
 ## Superadmin requests
 

@@ -142,6 +142,52 @@ MIGRATIONS = [
         PRIMARY KEY (goal_id, target_id)
     );
     """,
+    """
+    -- Goals get a start time and a repeat of any number of hours, days, weeks or months, in place of
+    -- a first day and a number of days; and reminders become offsets before a cycle's end, in place
+    -- of days before the last day and an hour. Both tables are rebuilt, the targets too because
+    -- dropping the table they point at would otherwise delete them.
+    CREATE TABLE throwing_goals_new (
+        id                INTEGER PRIMARY KEY AUTOINCREMENT,
+        name              TEXT NOT NULL,
+        minutes           INTEGER NOT NULL CHECK (minutes > 0),   -- per person, per cycle
+        -- When cycle 0 starts: YYYY-MM-DDTHH:MM on the clock in the bot's time zone. Kept as clock
+        -- time, not UTC, so a cycle that repeats in days, weeks or months starts at the same time
+        -- of day on both sides of a daylight-saving change. It may be in the past.
+        starts_at         TEXT NOT NULL,
+        every_count       INTEGER NOT NULL CHECK (every_count > 0),
+        every_unit        TEXT NOT NULL CHECK (every_unit IN ('hour', 'day', 'week', 'month')),
+        channel_id        INTEGER NOT NULL,              -- where reminders and new groups are posted
+        reminders         TEXT NOT NULL DEFAULT '',      -- how long before a cycle ends, comma-separated: 2d,6h,30m
+        last_reminder_at  TEXT,                          -- ISO 8601, UTC; reminder times up to here are done
+        group_config      TEXT,                          -- JSON GroupConfig; NULL: don't make groups each cycle
+        groups_cycle      INTEGER NOT NULL DEFAULT -1,   -- the last cycle groups were made for
+        created_by        INTEGER NOT NULL,              -- Discord user ID
+        created_at        TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+    INSERT INTO throwing_goals_new
+        (id, name, minutes, starts_at, every_count, every_unit, channel_id, reminders, last_reminder_at,
+         group_config, groups_cycle, created_by, created_at)
+    SELECT id, name, minutes, first_day || 'T00:00', cycle_days, 'day', channel_id,
+           -- remind_hour on the day d days before the last day is d * 24 + 24 - remind_hour hours before the end
+           COALESCE((SELECT group_concat((value * 24 + 24 - remind_hour) || 'h')
+                     FROM json_each('[' || remind_days_before || ']')), ''),
+           last_reminder_at, group_config, groups_cycle, created_by, created_at
+    FROM throwing_goals;
+    CREATE TEMP TABLE goal_targets_kept AS SELECT * FROM throwing_goal_targets;
+    DROP TABLE throwing_goal_targets;
+    DROP TABLE throwing_goals;
+    ALTER TABLE throwing_goals_new RENAME TO throwing_goals;
+    CREATE TABLE throwing_goal_targets (
+        goal_id    INTEGER NOT NULL REFERENCES throwing_goals(id) ON DELETE CASCADE,
+        target_id  INTEGER NOT NULL,                       -- Discord role or user ID
+        is_role    INTEGER NOT NULL,
+        excluded   INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (goal_id, target_id)
+    );
+    INSERT INTO throwing_goal_targets SELECT * FROM goal_targets_kept;
+    DROP TABLE goal_targets_kept;
+    """,
 ]
 
 
@@ -579,11 +625,11 @@ class Database:
         *,
         name: str,
         minutes: int,
-        first_day: str,
-        cycle_days: int,
+        starts_at: str,
+        every_count: int,
+        every_unit: str,
         channel_id: int,
-        remind_days_before: list[int],
-        remind_hour: int,
+        reminders: list[str],
         group_config: dict | None,
         targets: list[dict],
         created_by: int,
@@ -592,11 +638,11 @@ class Database:
         goal made late in a cycle doesn't send that cycle's earlier reminders at once."""
         try:
             cur = await self.conn.execute(
-                "INSERT INTO throwing_goals (name, minutes, first_day, cycle_days, channel_id, remind_days_before, "
-                "remind_hour, last_reminder_at, group_config, created_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO throwing_goals (name, minutes, starts_at, every_count, every_unit, channel_id, reminders, "
+                "last_reminder_at, group_config, created_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
-                    name, minutes, first_day, cycle_days, channel_id, ",".join(map(str, remind_days_before)),
-                    remind_hour, _utc(datetime.now(timezone.utc)), group_config and json.dumps(group_config), created_by,
+                    name, minutes, starts_at, every_count, every_unit, channel_id, ",".join(reminders),
+                    _utc(datetime.now(timezone.utc)), group_config and json.dumps(group_config), created_by,
                 ),
             )
             await self.conn.executemany(
@@ -614,7 +660,7 @@ class Database:
         async with self.conn.execute(f"SELECT * FROM throwing_goals WHERE {where} ORDER BY id", params) as cur:
             goals = [dict(row) for row in await cur.fetchall()]
         for goal in goals:
-            goal["remind_days_before"] = [int(d) for d in goal["remind_days_before"].split(",") if d]
+            goal["reminders"] = [r for r in goal["reminders"].split(",") if r]
             goal["group_config"] = json.loads(goal["group_config"]) if goal["group_config"] else None
             async with self.conn.execute(
                 "SELECT target_id, is_role, excluded FROM throwing_goal_targets WHERE goal_id = ? ORDER BY excluded, is_role DESC",

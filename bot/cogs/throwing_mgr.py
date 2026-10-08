@@ -7,7 +7,8 @@ worked out by the session_groups view (bot/db.py) from each group's two settings
 
 A goal (`/throwing-mgr goal ...`) is a number of minutes each person in a pool should throw every
 cycle. Once a minute the bot checks each goal: at the start of a cycle it can make that cycle's
-groups, and at the goal's reminder times it pings the people who aren't there yet.
+groups, and at the goal's reminder times it pings the people who aren't there yet. When cycles start
+and end, daylight saving included, is worked out in bot/goals.py.
 
 How groups are made is described once, by GroupConfig: its fields are the settings, SETTINGS is how
 they're labelled, and GroupConfigFields is how a form asks for them. `creategroups` and goals both go
@@ -89,8 +90,17 @@ def last_day(group: dict) -> date:
     return (datetime.fromisoformat(group["ends_at"]) - timedelta(seconds=1)).astimezone(TZ).date()
 
 
+def moment_text(at: datetime) -> str:
+    at = at.astimezone(TZ)
+    return f"{at:%a %b} {at.day}, {at.hour % 12 or 12}:{at:%M %p}"
+
+
 def life_text(starts_at: datetime, ends_at: datetime) -> str:
-    first, last = starts_at.astimezone(TZ), (ends_at - timedelta(seconds=1)).astimezone(TZ)
+    """Whole days read as "Oct 5 – Oct 11". Anything that starts or ends during a day gets its times."""
+    first, end = starts_at.astimezone(TZ), ends_at.astimezone(TZ)
+    if (first.hour, first.minute, end.hour, end.minute) != (0, 0, 0, 0):
+        return f"{moment_text(first)} – {moment_text(end)}"
+    last = end.date() - timedelta(days=1)
     return f"{first:%b} {first.day} – {last:%b} {last.day}"
 
 
@@ -137,8 +147,11 @@ class GroupConfig:
 class GroupConfigFields:
     """The form fields that ask for a GroupConfig: the size and a checkbox per setting."""
 
-    def __init__(self, typed_size: str | None = None):
-        self.size = discord.ui.TextInput(default=typed_size or str(GroupConfig.size), max_length=2)
+    def __init__(self, typed_size: str | None = None, *, optional: bool = False):
+        """With optional, the size starts blank and leaving it blank means "no groups"."""
+        self.optional = optional
+        default = typed_size if optional else typed_size or str(GroupConfig.size)
+        self.size = discord.ui.TextInput(default=default or None, max_length=2, required=not optional)
         self.settings = discord.ui.CheckboxGroup(
             required=False,
             options=[
@@ -148,14 +161,19 @@ class GroupConfigFields:
         )
 
     def add_to(self, modal: discord.ui.Modal):
-        modal.add_item(discord.ui.Label(text="Group size", component=self.size))
+        modal.add_item(discord.ui.Label(
+            text="Group size", component=self.size,
+            description="For new random groups every cycle. Leave blank to make none." if self.optional else None,
+        ))
         modal.add_item(discord.ui.Label(text="Group settings", component=self.settings))
 
     @property
     def typed_size(self) -> str:
         return self.size.value.strip()
 
-    def read(self) -> GroupConfig:
+    def read(self) -> GroupConfig | None:
+        if self.optional and not self.typed_size:
+            return None
         if not self.typed_size.isdigit() or not 1 <= int(self.typed_size) <= MAX_GROUP_SIZE:
             raise InputError(f"Group size has to be a number from 1 to {MAX_GROUP_SIZE}.")
         chosen = set(self.settings.values)
@@ -431,15 +449,50 @@ def describe(group: dict) -> str:
 
 # ---- goals ----
 
-def parse_remind_days(text: str | None, cycle_days: int) -> list[int]:
-    """ "2, 0" -> [2, 0]: how many days before a cycle's last day to remind on."""
-    days = re.findall(r"\d+", text or "")
-    if text and text.strip() and (not days or re.sub(r"[\d\s,]", "", text)):
-        raise InputError(f"Reminder days `{text}` should be numbers separated by commas, like `2, 0`.")
-    days = sorted({int(d) for d in days}, reverse=True)
-    if any(d >= cycle_days for d in days):
-        raise InputError(f"Reminder days have to be from 0 (the last day) to {cycle_days - 1} (the first day).")
-    return days
+def parse_clock(text: str) -> time:
+    """20:00, 8pm, 8:30 pm."""
+    m = re.fullmatch(r"(\d{1,2})(?::(\d{2}))?\s*(am|pm|a|p)?", text.strip().lower().replace(".", ""))
+    hour, minute = (int(m[1]), int(m[2] or 0)) if m else (99, 0)
+    if m and m[3]:
+        hour = hour % 12 + (12 if m[3][0] == "p" else 0) if 1 <= hour <= 12 else 99
+    if not m or (m[2] is None and m[3] is None) or hour > 23 or minute > 59:
+        raise InputError(f"`{text}` isn't a time of day. Use 20:00 or 8pm.")
+    return time(hour, minute)
+
+
+def parse_moment(text: str) -> datetime:
+    """A date with an optional time of day: "2026-10-04 20:00", "10/4 8pm", "2026-10-05" (midnight).
+    It's a time on the clock in the bot's time zone, with no time zone attached."""
+    day, _, clock = text.strip().replace("T", " ", 1).partition(" ")
+    return datetime.combine(parse_day(day, "Start date"), parse_clock(clock) if clock.strip() else time())
+
+
+def parse_every(text: str) -> tuple[int, str]:
+    """ "week", "2 weeks", "3 days", "12 hours", "1 month" -> (count, unit)."""
+    m = re.fullmatch(r"(\d+)?\s*(hours?|hrs?|h|days?|d|weeks?|wks?|w|months?|mos?)", text.strip().lower())
+    if not m or not 1 <= int(m[1] or 1) <= 1000:
+        raise InputError(f"`{text}` isn't a repeat I understand. Use a number of hours, days, weeks or months, like `1 week`.")
+    return int(m[1] or 1), next(u for u in goals.UNITS if u[0] == m[2][0])
+
+
+def parse_reminders(text: str) -> list[str]:
+    """ "2d, 6 hours, 30m" -> ["2d", "6h", "30m"]: how long before a cycle ends."""
+    offsets = []
+    for part in filter(None, (p.strip() for p in re.split(r",|\band\b", text.lower()))):
+        m = re.fullmatch(r"(\d+)\s*(m|mins?|minutes?|h|hrs?|hours?|d|days?)", part)
+        if not m or int(m[1]) < 1:
+            raise InputError(f"Reminder `{part}` should be a number of days, hours or minutes, like `2d`, `6h` or `30m`.")
+        offsets.append(f"{int(m[1])}{m[2][0]}")
+    return list(dict.fromkeys(offsets))
+
+
+def every_text(goal: dict) -> str:
+    return goal["every_unit"] if goal["every_count"] == 1 else f"{goal['every_count']} {goal['every_unit']}s"
+
+
+def offset_text(offset: str) -> str:
+    count, unit = goals.parse_offset(offset)
+    return f"{count} {goals.OFFSET_UNITS[unit][:-1]}{'' if count == 1 else 's'}"
 
 
 def pool_text(targets: list[dict]) -> str:
@@ -452,20 +505,18 @@ def pool_text(targets: list[dict]) -> str:
 
 
 def describe_goal(goal: dict) -> str:
-    now = datetime.now(TZ)
-    cycle = goals.current_cycle(goal, now, TZ)
+    cycle = goals.current_cycle(goal, datetime.now(TZ), TZ)
     if cycle is None:
-        when = f"starts {date.fromisoformat(goal['first_day']):%b %-d}"
+        when = f"starts {moment_text(goals.cycle_start(goal, 0, TZ))}"
     else:
         when = f"now {life_text(*goals.cycle_bounds(goal, cycle, TZ))}"
-    every = "week" if goal["cycle_days"] == 7 else "day" if goal["cycle_days"] == 1 else f"{goal['cycle_days']} days"
     lines = [
-        f"`#{goal['id']}` **{goal['name']}** · {goal['minutes']} min each, every {every} ({when}) · <#{goal['channel_id']}>",
+        f"`#{goal['id']}` **{goal['name']}** · {goal['minutes']} min each, every {every_text(goal)} ({when}) · <#{goal['channel_id']}>",
         f"-# For {pool_text(goal['targets'])}.",
     ]
-    if goal["remind_days_before"]:
-        days = ", ".join("the last day" if d == 0 else f"{d} day(s) before it" for d in sorted(goal["remind_days_before"]))
-        lines.append(f"-# Reminds people who are short at {goal['remind_hour']:02d}:00 on {days}.")
+    if goal["reminders"]:
+        offsets = ", ".join(offset_text(o) for o in goal["reminders"])
+        lines.append(f"-# Reminds people who are short {offsets} before each cycle ends.")
     else:
         lines.append("-# No reminders.")
     if goal["group_config"]:
@@ -474,10 +525,10 @@ def describe_goal(goal: dict) -> str:
     return "\n".join(lines)
 
 
-async def goal_progress(db, guild: discord.Guild, goal: dict, cycle: int) -> list[tuple[int, int]]:
-    """(Discord ID, minutes thrown this cycle) for everyone the goal applies to, fewest minutes first.
-    Every session a person took part in counts, whatever group it was or wasn't with."""
-    members = await resolve_pool(guild, goal["targets"])
+async def goal_progress(db, goal: dict, cycle: int, members: list[int]) -> list[tuple[int, int]]:
+    """(Discord ID, minutes thrown in that cycle) for these people, fewest minutes first. Every
+    session a person took part in counts, whatever group it was or wasn't with. Any cycle can be
+    asked for, including ones from before the goal was created: it's all read from the sessions."""
     if not members:
         return []
     start, end = goals.cycle_bounds(goal, cycle, TZ)
@@ -485,45 +536,142 @@ async def goal_progress(db, guild: discord.Guild, goal: dict, cycle: int) -> lis
     return sorted(((i, thrown.get(i, 0)) for i in members), key=lambda pair: pair[1])
 
 
-class CreateGoalModal(discord.ui.Modal, title="Who is the goal for?"):
-    """The second half of /throwing-mgr goal create: the pool, and the groups to make if it makes any."""
+class OpenFormView(discord.ui.View):
+    """One button that opens a form. A form can't open another form, so this goes in between."""
 
-    def __init__(self, db, goal: dict, make_groups: bool, typed_size: str | None = None):
+    def __init__(self, label: str, make_modal):
+        super().__init__(timeout=PREVIEW_SECONDS)
+        self.make_modal = make_modal
+        button = discord.ui.Button(label=label, style=discord.ButtonStyle.primary)
+        button.callback = self._open
+        self.add_item(button)
+
+    async def _open(self, interaction: discord.Interaction):
+        await interaction.response.send_modal(self.make_modal())
+
+
+class GoalBasicsModal(discord.ui.Modal, title="New goal (1 of 2): who and how much"):
+    """A goal takes more than the five fields one form holds, so it's two forms with a button between."""
+
+    def __init__(self, db, channel, typed: dict[str, str] | None = None):
         super().__init__()
         self.db = db
-        self.goal = goal  # what was given to the command
+        self.default_channel = channel
+        typed = typed or {}
+        self.name = discord.ui.TextInput(default=typed.get("name"), placeholder="e.g. Weekly throwing", max_length=50)
+        self.minutes = discord.ui.TextInput(default=typed.get("minutes"), placeholder="e.g. 100", max_length=5)
         self.pool = PoolFields("the goal applies to")
+        self.channel = discord.ui.ChannelSelect(
+            channel_types=[discord.ChannelType.text], min_values=1, max_values=1,
+            default_values=[channel] if isinstance(channel, discord.TextChannel) else [],
+        )
+        self.add_item(discord.ui.Label(text="Name", component=self.name))
+        self.add_item(discord.ui.Label(
+            text="Minutes", description="How many minutes each person should throw per cycle.", component=self.minutes
+        ))
         self.pool.add_to(self)
-        self.config = GroupConfigFields(typed_size) if make_groups else None
-        if self.config:
-            self.config.add_to(self)
+        self.add_item(discord.ui.Label(
+            text="Channel", description="Where reminders, and new groups, are posted.", component=self.channel
+        ))
 
     async def on_submit(self, interaction: discord.Interaction):
+        typed = {"name": self.name.value.strip(), "minutes": self.minutes.value.strip()}
         targets = self.pool.targets()
+        channel = interaction.guild.get_channel(self.channel.values[0].id)
         try:
-            cfg = self.config.read() if self.config else None
+            if not typed["name"]:
+                raise InputError("The name is empty.")
+            if not typed["minutes"].isdigit() or not 1 <= int(typed["minutes"]) <= 10000:
+                raise InputError("Minutes has to be a number from 1 to 10000.")
+            perms = channel and channel.permissions_for(interaction.guild.me)
+            if not (perms and perms.view_channel and perms.send_messages):
+                raise InputError(f"I can't post in <#{self.channel.values[0].id}>. Give me **View Channel** and **Send Messages** there.")
             if not await resolve_pool(interaction.guild, targets):
                 raise InputError("Nobody is in that pool.")
         except InputError as e:
-            typed_size = self.config and self.config.typed_size
+            # The pool and exclusions have to be picked again; what was typed is kept.
             await interaction.response.send_message(
-                f"Not created: {e}",
-                view=RetryView(lambda: CreateGoalModal(self.db, self.goal, bool(self.config), typed_size)),
+                f"Not saved: {e}",
+                view=RetryView(lambda: GoalBasicsModal(self.db, channel or self.default_channel, typed)),
                 ephemeral=True,
             )
             return
-        goal_id = await self.db.create_goal(
-            **self.goal, group_config=cfg and asdict(cfg), targets=targets, created_by=interaction.user.id
-        )
-        log.info("%s created throwing goal %s (%s)", interaction.user, goal_id, self.goal["name"])
-        note = "\nThis cycle's groups will be posted in its channel within a minute." if cfg else ""
+        details = dict(name=typed["name"], minutes=int(typed["minutes"]), channel_id=channel.id, targets=targets)
         await interaction.response.send_message(
-            "Goal created.\n" + describe_goal(await self.db.get_goal(goal_id)) + note,
+            f"**{details['name']}**: {details['minutes']} min each, for {pool_text(targets)}, in {channel.mention}.\n"
+            "Nothing is saved yet. Next, when it repeats.",
+            view=OpenFormView("Next: schedule and groups", lambda: GoalScheduleModal(self.db, details)),
             ephemeral=True, allowed_mentions=discord.AllowedMentions.none(),
         )
 
     async def on_error(self, interaction: discord.Interaction, error: Exception):
         log.error("Error in the create-goal form", exc_info=error)
+        await modal_failed(interaction, "Something went wrong creating the goal.")
+
+
+class GoalScheduleModal(discord.ui.Modal, title="New goal (2 of 2): schedule and groups"):
+    def __init__(self, db, details: dict, typed: dict[str, str] | None = None):
+        super().__init__()
+        self.db = db
+        self.details = details  # from the first form
+        today = datetime.now(TZ).date()
+        typed = typed or {"start": f"{today - timedelta(days=today.weekday())} 00:00", "every": "1 week", "reminders": "", "size": ""}
+        self.start = discord.ui.TextInput(default=typed["start"], max_length=30)
+        self.every = discord.ui.TextInput(default=typed["every"], max_length=20)
+        self.reminders = discord.ui.TextInput(default=typed["reminders"] or None, required=False, max_length=60)
+        self.config = GroupConfigFields(typed["size"], optional=True)
+        self.add_item(discord.ui.Label(
+            text="First cycle starts",
+            description="Date and time, like 2026-10-04 20:00 or 10/4 8pm. A past date counts the cycles since then too.",
+            component=self.start,
+        ))
+        self.add_item(discord.ui.Label(
+            text="Repeats every", description="A number of hours, days, weeks or months: 1 week, 3 days, 12 hours.",
+            component=self.every,
+        ))
+        self.add_item(discord.ui.Label(
+            text="Reminders",
+            description="How long before each cycle ends to ping people who are short: 2d, 6h. Blank for none.",
+            component=self.reminders,
+        ))
+        self.config.add_to(self)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        typed = {
+            "start": self.start.value.strip(), "every": self.every.value.strip(),
+            "reminders": self.reminders.value.strip(), "size": self.config.typed_size,
+        }
+        try:
+            count, unit = parse_every(typed["every"])
+            schedule = dict(
+                starts_at=parse_moment(typed["start"]).isoformat(timespec="minutes"),
+                every_count=count, every_unit=unit, reminders=parse_reminders(typed["reminders"]),
+            )
+            for offset in schedule["reminders"]:
+                if not goals.reminder_times({**schedule, "reminders": [offset]}, 0, TZ):
+                    raise InputError(f"A reminder {offset_text(offset)} before the end doesn't fit in a cycle of {every_text(schedule)}.")
+            cfg = self.config.read()
+        except InputError as e:
+            await interaction.response.send_message(
+                f"Not created: {e}",
+                view=RetryView(lambda: GoalScheduleModal(self.db, self.details, typed)),
+                ephemeral=True,
+            )
+            return
+        goal_id = await self.db.create_goal(
+            **self.details, **schedule, group_config=cfg and asdict(cfg), created_by=interaction.user.id
+        )
+        log.info("%s created throwing goal %s (%s)", interaction.user, goal_id, self.details["name"])
+        goal = await self.db.get_goal(goal_id)
+        reply = "Goal created.\n" + describe_goal(goal)
+        if cycle := goals.current_cycle(goal, datetime.now(TZ), TZ):
+            reply += f"\nIt started {cycle} cycle(s) ago. `/throwing-mgr goal history` shows how those went."
+        if cfg:
+            reply += "\nThis cycle's groups will be posted in its channel within a minute."
+        await interaction.response.send_message(reply, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception):
+        log.error("Error in the create-goal schedule form", exc_info=error)
         await modal_failed(interaction, "Something went wrong creating the goal.")
 
 
@@ -653,7 +801,7 @@ class ThrowingMgr(commands.GroupCog, group_name="throwing-mgr", group_descriptio
     async def _goal_choices(self, interaction: discord.Interaction, current: str) -> list[app_commands.Choice[int]]:
         choices = []
         for g in await self.db.list_goals():
-            label = f"#{g['id']} {g['name']} · {g['minutes']} min every {g['cycle_days']} day(s)"
+            label = f"#{g['id']} {g['name']} · {g['minutes']} min every {every_text(g)}"
             if current.lower().lstrip("#") in label.lower():
                 choices.append(app_commands.Choice(name=label[:100], value=g["id"]))
         return choices[:25]
@@ -666,48 +814,9 @@ class ThrowingMgr(commands.GroupCog, group_name="throwing-mgr", group_descriptio
             )
         return found
 
-    @goal.command(name="create", description="Set a minutes goal that repeats. A form then asks who it's for.")
-    @app_commands.describe(
-        name="What to call it, e.g. Weekly throwing",
-        minutes="Minutes each person should throw per cycle",
-        channel="Where reminders (and new groups) are posted",
-        make_groups="Make new random throwing groups from the goal's people at the start of every cycle",
-        cycle_days="How long a cycle is. Default 7",
-        first_day="First day of the first cycle, YYYY-MM-DD. Default: Monday of this week",
-        remind_days_before="Days before a cycle's last day to remind on, e.g. \"2, 0\" (0 is the last day). Blank: no reminders",
-        remind_hour="Hour of the day reminders go out, 0-23. Default 18",
-    )
-    async def goal_create(
-        self,
-        interaction: discord.Interaction,
-        name: app_commands.Range[str, 1, 50],
-        minutes: app_commands.Range[int, 1, 10000],
-        channel: discord.TextChannel,
-        make_groups: bool = False,
-        cycle_days: app_commands.Range[int, 1, 366] = 7,
-        first_day: str | None = None,
-        remind_days_before: str | None = None,
-        remind_hour: app_commands.Range[int, 0, 23] = 18,
-    ):
-        today = datetime.now(TZ).date()
-        try:
-            first = parse_day(first_day, "First day") if first_day else today - timedelta(days=today.weekday())
-            remind_days = parse_remind_days(remind_days_before, cycle_days)
-        except InputError as e:
-            await interaction.response.send_message(f"Not created: {e}", ephemeral=True)
-            return
-        perms = channel.permissions_for(interaction.guild.me)
-        if not (perms.view_channel and perms.send_messages):
-            await interaction.response.send_message(
-                f"I can't post in {channel.mention}. Give me **View Channel** and **Send Messages** there first.",
-                ephemeral=True,
-            )
-            return
-        details = dict(
-            name=name.strip(), minutes=minutes, first_day=first.isoformat(), cycle_days=cycle_days,
-            channel_id=channel.id, remind_days_before=remind_days, remind_hour=remind_hour,
-        )
-        await interaction.response.send_modal(CreateGoalModal(self.db, details, make_groups))
+    @goal.command(name="create", description="Set a minutes goal that repeats. Opens a form.")
+    async def goal_create(self, interaction: discord.Interaction):
+        await interaction.response.send_modal(GoalBasicsModal(self.db, interaction.channel))
 
     @goal.command(name="list", description="Show the minutes goals.")
     async def goal_list(self, interaction: discord.Interaction):
@@ -720,23 +829,67 @@ class ThrowingMgr(commands.GroupCog, group_name="throwing-mgr", group_descriptio
         for part in parts[1:]:
             await interaction.followup.send(part, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
 
-    @goal.command(name="progress", description="Who has and hasn't reached a goal this cycle.")
+    @goal.command(name="progress", description="Who has and hasn't reached a goal, this cycle or an earlier one.")
+    @app_commands.describe(cycles_ago="0 is the current cycle (the default), 1 the one before, and so on")
     @app_commands.autocomplete(goal=_goal_choices)
-    async def goal_progress_(self, interaction: discord.Interaction, goal: int):
+    async def goal_progress_(
+        self, interaction: discord.Interaction, goal: int, cycles_ago: app_commands.Range[int, 0, 10000] = 0
+    ):
         if not (found := await self._find_goal(interaction, goal)):
             return
-        cycle = goals.current_cycle(found, datetime.now(TZ), TZ)
-        if cycle is None:
+        current = goals.current_cycle(found, datetime.now(TZ), TZ)
+        if current is None:
+            await interaction.response.send_message("That goal hasn't started yet.\n" + describe_goal(found), ephemeral=True)
+            return
+        if cycles_ago > current:
+            await interaction.response.send_message(
+                f"That goal only goes back {current} cycle(s): it started {moment_text(goals.cycle_start(found, 0, TZ))}.",
+                ephemeral=True,
+            )
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        cycle = current - cycles_ago
+        progress = await goal_progress(self.db, found, cycle, await resolve_pool(interaction.guild, found["targets"]))
+        reached = sum(minutes >= found["minutes"] for _, minutes in progress)
+        lines = [
+            f"**{found['name']}**, {life_text(*goals.cycle_bounds(found, cycle, TZ))}"
+            f"{'' if cycles_ago else ' (still running)'}: {reached} of {len(progress)} at {found['minutes']} min",
+            *(f"{'✅' if minutes >= found['minutes'] else '▫️'} <@{i}> {minutes}" for i, minutes in progress[::-1]),
+        ]
+        if cycles_ago:
+            lines.append("-# For the people the goal applies to today, whoever it applied to then.")
+        for part in chunks(lines):
+            await interaction.followup.send(part, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+
+    @goal.command(name="history", description="How a goal went over its recent cycles, including any before it was created.")
+    @app_commands.describe(cycles="How many cycles back to show, counting the current one. Default 8")
+    @app_commands.autocomplete(goal=_goal_choices)
+    async def goal_history(self, interaction: discord.Interaction, goal: int, cycles: app_commands.Range[int, 1, 26] = 8):
+        if not (found := await self._find_goal(interaction, goal)):
+            return
+        current = goals.current_cycle(found, datetime.now(TZ), TZ)
+        if current is None:
             await interaction.response.send_message("That goal hasn't started yet.\n" + describe_goal(found), ephemeral=True)
             return
         await interaction.response.defer(ephemeral=True, thinking=True)
-        progress = await goal_progress(self.db, interaction.guild, found, cycle)
-        reached = sum(minutes >= found["minutes"] for _, minutes in progress)
-        lines = [
-            f"**{found['name']}**, {life_text(*goals.cycle_bounds(found, cycle, TZ))}: "
-            f"{reached} of {len(progress)} at {found['minutes']} min",
-            *(f"{'✅' if minutes >= found['minutes'] else '▫️'} <@{i}> {minutes}" for i, minutes in progress[::-1]),
-        ]
+        members = await resolve_pool(interaction.guild, found["targets"])
+        shown = range(max(0, current - cycles + 1), current + 1)  # oldest first
+        thrown = {i: [] for i in members}  # each person's minutes, one per cycle shown
+        lines = [f"**{found['name']}**: {found['minutes']} min every {every_text(found)}"]
+        for cycle in shown:
+            progress = await goal_progress(self.db, found, cycle, members)
+            for i, minutes in progress:
+                thrown[i].append(minutes)
+            reached = sum(minutes >= found["minutes"] for _, minutes in progress)
+            lines.append(
+                f"{life_text(*goals.cycle_bounds(found, cycle, TZ))}: {reached} of {len(progress)} reached it"
+                + (" (still running)" if cycle == current else "")
+            )
+        lines.append("**Cycles reached per person** (minutes each cycle, oldest first)")
+        hits = lambda minutes: sum(m >= found["minutes"] for m in minutes)
+        for i, minutes in sorted(thrown.items(), key=lambda pair: (-hits(pair[1]), -sum(pair[1]))):
+            lines.append(f"<@{i}> {hits(minutes)} of {len(shown)} · {', '.join(map(str, minutes))}")
+        lines.append("-# For the people the goal applies to today, whoever it applied to then.")
         for part in chunks(lines):
             await interaction.followup.send(part, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
 
@@ -768,12 +921,18 @@ class ThrowingMgr(commands.GroupCog, group_name="throwing-mgr", group_descriptio
             return f"The goal's channel (<#{goal['channel_id']}>) is gone or hidden from me."
         if cycle is None:
             return "That goal hasn't started yet."
-        short = [(i, m) for i, m in await goal_progress(self.db, channel.guild, goal, cycle) if m < goal["minutes"]]
+        members = await resolve_pool(channel.guild, goal["targets"])
+        short = [(i, m) for i, m in await goal_progress(self.db, goal, cycle, members) if m < goal["minutes"]]
         if not short:
             return "Nobody to remind: everyone has reached it."
-        final = goals.last_day(goal, cycle)
+        end = goals.cycle_start(goal, cycle + 1, TZ)
+        if (end.hour, end.minute) == (0, 0):
+            final = end.date() - timedelta(days=1)
+            by = f"the end of {final:%A}, {final:%b} {final.day}"
+        else:
+            by = moment_text(end)
         lines = [
-            f"**{goal['name']}: {goal['minutes']} min by the end of {final:%A}, {final:%b} {final.day}.** Not there yet:",
+            f"**{goal['name']}: {goal['minutes']} min by {by}.** Not there yet:",
             *(f"<@{i}> {minutes}/{goal['minutes']}" for i, minutes in short),
         ]
         for part in chunks(lines):
@@ -811,7 +970,7 @@ class ThrowingMgr(commands.GroupCog, group_name="throwing-mgr", group_descriptio
         if due := goals.due_reminder(goal, now, TZ):
             # Marked before sending: if the send fails halfway, people aren't pinged again a minute later.
             await self.db.mark_goal_reminded(goal["id"], now)
-            if now - due > REMINDER_GRACE:
+            if now.astimezone(timezone.utc) - due.astimezone(timezone.utc) > REMINDER_GRACE:
                 log.warning("Skipped throwing goal %s's %s reminder: the bot wasn't running then", goal["id"], f"{due:%a %H:%M}")
             else:
                 log.info("Throwing goal %s reminder: %s", goal["id"], await self._remind(goal))
